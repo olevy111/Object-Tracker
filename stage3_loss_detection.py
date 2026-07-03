@@ -75,6 +75,20 @@ MAX_BBOX_AREA_FRAC = 0.03     # sanity cap: box bigger than this fraction of the
 # 3% sits with margin in the gap between the two -- this is the dominant,
 # reliable gate against the catastrophic full-frame lock.
 
+MAX_BBOX_ASPECT_RATIO = 2.0   # sanity cap: reject a box whose long side is more than this many
+                              # times its short side
+
+# Why: found live on a small, low-contrast object sitting next to a diagonal
+# road/path -- VitTrack's regression drifted to follow the linear road
+# feature instead of staying on the object, growing the box's HEIGHT
+# steadily (40 -> 57 -> 81 -> 98 -> 110px) while width stayed contained
+# (35-52px) -- an elongated strip straddling the road, confirmed visually,
+# not a tight box on the object. This is the same regression-runaway
+# instability as the full-frame catastrophic lock (MAX_BBOX_AREA_FRAC above),
+# just shaped differently (elongated, not large-area) because a nearby
+# linear feature rather than open terrain is what it latched onto. A real
+# small object is expected to be roughly compact, not a long thin strip.
+
 TEMPLATE_MATCH_THRESHOLD = 0.10  # min normalized cross-correlation to accept a recovery
 GOOD_TEMPLATE_SCORE = 0.5        # refresh the "recent" reference template only on strong frames
 
@@ -100,6 +114,8 @@ def is_valid(bbox, score, frame_area):
     if w <= 0 or h <= 0:
         return False
     if (w * h) > MAX_BBOX_AREA_FRAC * frame_area:
+        return False
+    if max(w, h) > MAX_BBOX_ASPECT_RATIO * min(w, h):
         return False
     return True
 

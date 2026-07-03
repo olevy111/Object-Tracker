@@ -125,10 +125,10 @@ import time
 import cv2
 import numpy as np
 
-from stage1_overlay import OverlayCleaner, pick_point_by_click, VX0, VX1, CX, CY
+from stage1_overlay import OverlayCleaner, pick_point_by_click, bbox_overlaps_mask, VX0, VX1, CX, CY
 from stage3_loss_detection import (
     is_valid, draw_tracking,
-    SCORE_THRESHOLD, LOST_N_FRAMES, RECOVER_N_FRAMES, MAX_BBOX_AREA_FRAC,
+    SCORE_THRESHOLD, LOST_N_FRAMES, RECOVER_N_FRAMES, MAX_BBOX_AREA_FRAC, MAX_BBOX_ASPECT_RATIO,
 )
 from stage4_gmc import build_flow_feature_mask, estimate_motion, GMC_DOWNSCALE
 
@@ -146,6 +146,36 @@ ORB_MIN_MATCHES = 10
 ORB_TEMPLATE_PADDING = 25     # extra context (px) around the tracking box when cropping an ORB template;
                               # a bare 40px box yields ~0-5 keypoints, not enough to ever reach ORB_MIN_MATCHES
 TEMPLATE_REFRESH_FRAMES = 30  # refresh the "recent" template every N confident TRACKING frames
+
+# -- Known-obstruction occlusion grace (crossing a fixed overlay line) --
+OCCLUSION_MARGIN = 10
+# Why: traced a real loss precisely -- score forms a clean V-shape bottoming
+# out exactly when the tracked box crosses a fixed overlay line (measured:
+# distance-to-line 0.6px, score dropped to 0.225, its minimum in that whole
+# stretch), even with the object-following Telea cleaning fix already
+# active. Inpainting is always an approximation of the true pixels; VitTrack
+# is sensitive enough to notice the difference even when it looks fine to
+# the eye. Unlike a generic tracking failure, this is a KNOWN, PREDICTABLE,
+# BRIEF event -- we have the exact fixed-line geometry already (the same
+# mask Stage 1 inpaints). While the tracked box overlaps that mask (plus a
+# small margin), a low score is treated as an expected side effect of the
+# crossing rather than evidence of genuine loss: the score-gate is
+# suspended, but the geometric sanity checks (size, aspect ratio) are NOT --
+# a wildly wrong box is still rejected even mid-crossing. This mirrors
+# old_object_tracker.py's Kalman "occlusion bridge" concept (built for the
+# crosshair specifically) generalized to the diagonal lines too, without
+# needing a full Kalman filter: the tracker's own position is trusted
+# through the brief window instead of a separate motion prediction.
+
+LINE_GRACE_COOLDOWN = 10
+# Why a cooldown, not just an instantaneous overlap check: tested the plain
+# instantaneous version and the loss STILL fired at the same frame. Tracing
+# showed why -- the score doesn't recover the instant the box clears the
+# line; it stays depressed for several frames afterward (measured: still
+# below the 0.30 lost threshold 7 frames after the box was already 28-70px
+# clear of the line). The grace window now stays open for
+# LINE_GRACE_COOLDOWN frames after the most recent overlap, covering that
+# lingering recovery tail, not just the exact crossing instant.
 
 # -- Re-detection probation (protects the original object's identity) --
 CONFIRM_FRAMES = 20
@@ -285,15 +315,17 @@ def is_static_region(curr_frame, prev_frame, bbox, threshold=STATIC_DIFF_THRESHO
 
 
 def is_valid_for_recovery(bbox, score, frame_area):
-    """Same box-size sanity check as stage3's is_valid(), but gated on
-    RECOVERY_SCORE_THRESHOLD instead of the lower SCORE_THRESHOLD used to
-    declare loss -- see module docstring point 5."""
+    """Same box-size + aspect-ratio sanity checks as stage3's is_valid(), but
+    gated on RECOVERY_SCORE_THRESHOLD instead of the lower SCORE_THRESHOLD
+    used to declare loss -- see module docstring point 5."""
     if score < RECOVERY_SCORE_THRESHOLD:
         return False
     x, y, w, h = bbox
     if w <= 0 or h <= 0:
         return False
-    return (w * h) <= MAX_BBOX_AREA_FRAC * frame_area
+    if (w * h) > MAX_BBOX_AREA_FRAC * frame_area:
+        return False
+    return max(w, h) <= MAX_BBOX_ASPECT_RATIO * min(w, h)
 
 
 def estimate_velocity(pos_history):
@@ -430,7 +462,7 @@ def main():
         point = pick_point_by_click(frame1)
         print(f"Picked point: {point}")
 
-    cleaned1 = cleaner.clean(frame1)
+    cleaned1 = cleaner.clean(frame1, hint_center=point)
 
     half = args.box_size // 2
     params = cv2.TrackerVit_Params()
@@ -453,6 +485,7 @@ def main():
 
     bad_count = 0
     frames_since_refresh = 0
+    line_grace_remaining = 0
     lost_frames = 0
     match_count_display = 0
     search_mode_display = "-"
@@ -548,8 +581,21 @@ def main():
             break
         frame_idx += 1
 
+        # Position hint for object-following Telea cleaning (see stage1_overlay
+        # docstring) -- best-known position as of the END of the previous
+        # frame, since this frame's own position isn't known until after
+        # cleaning + tracking run on it.
+        if state == "TRACKING" and bbox is not None:
+            clean_hint = (bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2)
+        elif state == "LOST" and predicted_pos is not None:
+            clean_hint = predicted_pos
+        elif state == "HOLDING":
+            clean_hint = held_point
+        else:
+            clean_hint = None
+
         prev_cleaned = cleaned
-        cleaned = cleaner.clean(frame)
+        cleaned = cleaner.clean(frame, hint_center=clean_hint)
 
         # Motion prediction keeps propagating on EVERY frame we don't yet fully
         # trust -- both while LOST and while a re-detected candidate is still on
@@ -591,6 +637,7 @@ def main():
                 state = "TRACKING"
                 probation = False
                 probation_count = 0
+                line_grace_remaining = 0
                 pos_history = [(hx, hy)]
                 last_good_bbox = init_box
                 bbox = init_box
@@ -603,6 +650,20 @@ def main():
             _, bbox = tracker.update(cleaned)
             score = tracker.getTrackingScore()
             valid = is_valid(bbox, score, frame_area)
+            # Occlusion grace (see OCCLUSION_MARGIN docstring): a geometrically
+            # sane box that's merely low-scoring while crossing a known fixed
+            # line is treated as still-tracking, not a failure -- but a box
+            # that's ALSO geometrically bogus (size/aspect) never gets this
+            # grace, known-obstruction or not.
+            geo_sane = (bbox[2] > 0 and bbox[3] > 0
+                        and (bbox[2] * bbox[3]) <= MAX_BBOX_AREA_FRAC * frame_area
+                        and max(bbox[2], bbox[3]) <= MAX_BBOX_ASPECT_RATIO * min(bbox[2], bbox[3]))
+            currently_overlapping = geo_sane and bbox_overlaps_mask(bbox, cleaner.full_mask, OCCLUSION_MARGIN)
+            if currently_overlapping:
+                line_grace_remaining = LINE_GRACE_COOLDOWN
+            elif line_grace_remaining > 0:
+                line_grace_remaining -= 1
+            near_line = geo_sane and (currently_overlapping or line_grace_remaining > 0)
 
             if probation:
                 lost_frames += 1  # still mid lost-episode until confirmed -- keep the search clock running
@@ -635,19 +696,24 @@ def main():
                         n_transitions += 1
                         print(f"Frame {frame_idx} | TENTATIVE->LOST (candidate did not hold) | "
                               f"score={score:.3f} | resuming search from last CONFIRMED position")
-            elif valid:
+            elif valid or near_line:
                 bad_count = 0
                 last_good_bbox = bbox
                 cx, cy = bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2
                 pos_history.append((cx, cy))
                 if len(pos_history) > POS_HISTORY_LEN:
                     pos_history.pop(0)
-                frames_since_refresh += 1
-                if frames_since_refresh >= TEMPLATE_REFRESH_FRAMES:
-                    refreshed_gray = crop_orb_template(cleaned, bbox)
-                    if refreshed_gray is not None:
-                        recent_orb = orb.detectAndCompute(refreshed_gray, None)
-                    frames_since_refresh = 0
+                # Template refresh is still gated on `valid` alone (the ordinary
+                # score threshold), not `valid or near_line` -- a low-score frame
+                # excused only because of a line crossing can extend tracking,
+                # but must never become the new saved appearance template.
+                if valid:
+                    frames_since_refresh += 1
+                    if frames_since_refresh >= TEMPLATE_REFRESH_FRAMES:
+                        refreshed_gray = crop_orb_template(cleaned, bbox)
+                        if refreshed_gray is not None:
+                            recent_orb = orb.detectAndCompute(refreshed_gray, None)
+                        frames_since_refresh = 0
             else:
                 bad_count += 1
                 if bad_count >= args.lost_n:
@@ -720,6 +786,7 @@ def main():
                             probation = True
                             probation_count = 0
                             bad_count = 0
+                            line_grace_remaining = 0
                             bbox = candidate_bbox
                             n_transitions += 1
                             print(f"Frame {frame_idx} | LOST->TENTATIVE (re-detected, unconfirmed) | matches={n_matches} | "

@@ -18,9 +18,22 @@ Performance note (why two cleaning methods are used):
     accurate-but-costly Telea inpaint only on a small cropped ROI around the
     crosshair (~0.6ms, cheap because the crop is small), and use a fast
     directional gather-scatter fill (sample real pixels from just outside the
-    line, perpendicular to it) for the long diagonal lines elsewhere, where
-    quality matters less because the object is rarely exactly on those lines.
+    line, perpendicular to it) for the long diagonal lines elsewhere.
     Combined cost is ~2.5ms/frame -- ample headroom under the 30 FPS budget.
+
+    Revised after real testing: "the object is rarely exactly on those lines"
+    turned out to only hold near init. Over a long clip with real camera
+    motion, an object that starts well clear of the diagonals can still drift
+    across one later (confirmed live: 3 of 4 tracked objects crossed within
+    ~0.2px of a diagonal at some point in the clip). The fast fill visibly
+    notches/smears a small object's silhouette right where a line crosses it
+    (confirmed visually), which is exactly the wrong moment for the tracker
+    to see a corrupted template. Fix: `OverlayCleaner.clean()` now accepts an
+    optional `hint_center` (the last known/predicted object position) and
+    additionally runs a small full-Telea patch there too -- but ONLY if that
+    patch actually overlaps the mask (checked with a cheap `.any()`), so the
+    extra cost is paid solely on the rare frames where the object is actually
+    near a line, not every frame.
 
 Keys while playing:
     c  - toggle between showing the ORIGINAL and CLEANED stream
@@ -50,6 +63,7 @@ INPAINT_RADIUS = 3            # cv2.inpaint radius
 
 CROSSHAIR_ROI_PAD = 40        # extra context (px) around the crosshair arms for the Telea crop
 FAST_FILL_OFFSET = 6          # px to sample outside each diagonal line, perpendicular to it
+OBJECT_HINT_HALF_SIZE = 60    # px half-width of the object-following Telea patch (see clean())
 
 BOX_SIZE = 40
 WINDOW_NAME = "Stage 1 - Overlay Removal"
@@ -127,7 +141,14 @@ class OverlayCleaner:
         self.far_y2 = np.concatenate(y2_list)
         self.far_x2 = np.concatenate(x2_list)
 
-    def clean(self, frame):
+    def clean(self, frame, hint_center=None, hint_half_size=OBJECT_HINT_HALF_SIZE):
+        """`hint_center` = (x, y), the last known/predicted object position
+        (from the caller's tracker state) -- if given, and a small patch
+        around it actually overlaps the overlay mask, that patch also gets
+        full-quality Telea inpainting instead of the fast fill. See module
+        docstring: a real object can drift across a diagonal line later in
+        the clip even if it started clear of one, and the fast fill visibly
+        notches a small object's silhouette right at the crossing point."""
         out = frame.copy()
 
         # Fast directional fill for the diagonal lines away from the crosshair.
@@ -140,7 +161,38 @@ class OverlayCleaner:
         roi_crop = out[y0:y1, x0:x1]
         out[y0:y1, x0:x1] = cv2.inpaint(roi_crop, self.roi_mask, INPAINT_RADIUS, cv2.INPAINT_TELEA)
 
+        # Object-following Telea patch -- cheap no-op on the vast majority of
+        # frames where the hint isn't near any line (the `.any()` check is a
+        # simple slice scan, not an inpaint call).
+        if hint_center is not None:
+            hx, hy = hint_center
+            ox0 = max(0, int(hx - hint_half_size))
+            oy0 = max(0, int(hy - hint_half_size))
+            ox1 = min(self.width, int(hx + hint_half_size))
+            oy1 = min(self.height, int(hy + hint_half_size))
+            if ox1 > ox0 and oy1 > oy0:
+                hint_mask = self.full_mask[oy0:oy1, ox0:ox1]
+                if hint_mask.any():
+                    hint_crop = out[oy0:oy1, ox0:ox1]
+                    out[oy0:oy1, ox0:ox1] = cv2.inpaint(hint_crop, hint_mask, INPAINT_RADIUS, cv2.INPAINT_TELEA)
+
         return out
+
+
+def bbox_overlaps_mask(bbox, mask, margin=0):
+    """True if `bbox` (padded by `margin` px on each side) overlaps any
+    nonzero pixel of `mask` -- used to detect "the tracked object is
+    currently crossing a known fixed overlay line/crosshair", a
+    predictable, temporary obstruction rather than a generic tracking
+    failure. See stage5_redetection.py's occlusion-grace docstring."""
+    x, y, w, h = [int(round(v)) for v in bbox]
+    x0 = max(0, x - margin)
+    y0 = max(0, y - margin)
+    x1 = min(mask.shape[1], x + w + margin)
+    y1 = min(mask.shape[0], y + h + margin)
+    if x1 <= x0 or y1 <= y0:
+        return False
+    return bool(mask[y0:y1, x0:x1].any())
 
 
 def draw_box(frame, point, box_size=BOX_SIZE, color=(0, 255, 0)):
