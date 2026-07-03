@@ -119,8 +119,10 @@ Usage:
 
 import argparse
 import math
+import os
 import sys
 import time
+from datetime import datetime
 
 import cv2
 import numpy as np
@@ -166,6 +168,17 @@ OCCLUSION_MARGIN = 10
 # crosshair specifically) generalized to the diagonal lines too, without
 # needing a full Kalman filter: the tracker's own position is trusted
 # through the brief window instead of a separate motion prediction.
+#
+# Tried and REJECTED: a separate gate rejecting re-detection candidates near
+# a fixed overlay line (motivated by a few ACCEPTED candidates during search
+# measured 1.4-8.7px from a line). A/B test on two objects showed it had no
+# measurable benefit on the hard case it was built for (612/853 LOST either
+# way -- that object never re-confirms regardless) while actively breaking a
+# different, easier object: a legitimate recovery near a line got rejected,
+# nearly 6x'ing that object's LOST time (37/853 -> 218/853). A real object's
+# trajectory legitimately passes near these lines just as often as a false
+# match does, so proximity-to-line alone isn't a valid re-detection filter --
+# only OCCLUSION_MARGIN's grace-for-already-confirmed-tracks approach holds up.
 
 LINE_GRACE_COOLDOWN = 10
 # Why a cooldown, not just an instantaneous overlap check: tested the plain
@@ -238,6 +251,34 @@ MAX_ACCEPT_DISTANCE = 320        # px, hard reject for any candidate farther tha
                                   # ROI's own edge/corner
 MAX_LOST_FRAMES = 200            # TTL: give up searching gracefully after this many LOST frames
                                   # (module docstring point 7) rather than searching forever
+
+# -- Motion-only fallback re-init --
+MOTION_FALLBACK_MIN_LOST_FRAMES = 60   # give ORB priority for at least this long first (motion
+                                        # prediction drift is smallest early in a lost episode)
+MOTION_FALLBACK_INTERVAL = 30          # throttle: only try this once every N lost frames
+
+# Why: traced a real case where the motion prediction stayed in the right
+# general neighborhood for the rest of a clip, but ORB never once found
+# enough matches there to even propose a candidate -- the object was too
+# faint/small, or too visually similar to nearby clutter, for ORB to
+# discriminate at that position. If the tracker's OWN regression is more
+# capable of fine-tuning onto the right nearby feature than a single-shot
+# ORB match (untested going in), trusting the prediction directly, and
+# proving it out via the existing PROBATION mechanism (same
+# RECOVERY_SCORE_THRESHOLD + CONFIRM_FRAMES bar, same static-region guard on
+# the initial candidate), could recover cases ORB alone never even attempts.
+# This does NOT skip the safety net -- it only skips the requirement that
+# ORB be the one to nominate the candidate.
+#
+# frames_since_motion_fallback must advance during PROBATION too, not just
+# while state=="LOST": traced a real case near a grid line where ORB kept
+# proposing short-lived bad candidates (line/inpainting-seam artifacts) that
+# each entered TENTATIVE for a few frames before failing -- and the interval
+# counter was only wired to increment in the strict LOST branch, so these
+# frequent excursions froze it and it never reached MOTION_FALLBACK_INTERVAL.
+# The fallback exists precisely to rescue cases like this, so its retry
+# clock has to track true wall-clock time since the last attempt, the same
+# way lost_frames already does, not just time spent with no candidate at all.
 
 
 def make_orb():
@@ -474,6 +515,15 @@ def main():
     show_cleaned = args.show_cleaned
     show_mask = args.show_mask
 
+    output_dir = "outputs"
+    os.makedirs(output_dir, exist_ok=True)
+    video_stem = os.path.splitext(os.path.basename(args.video))[0]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = os.path.join(output_dir, f"{video_stem}_x{point[0]}_y{point[1]}_{timestamp}.mp4")
+    writer_fps = src_fps if src_fps and src_fps > 0 else 30.0
+    writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), writer_fps, (width, height))
+    print(f"Recording output to: {output_path}")
+
     frame_idx = 0
     fps_window_start = time.perf_counter()
     fps_frame_count = 0
@@ -487,6 +537,7 @@ def main():
     frames_since_refresh = 0
     line_grace_remaining = 0
     lost_frames = 0
+    frames_since_motion_fallback = 0
     match_count_display = 0
     search_mode_display = "-"
     n_lost_frames = 0
@@ -566,6 +617,7 @@ def main():
         cv2.putText(display, f"frame {frame_idx}  fps {display_fps:.1f}  [{stream_label}{mask_label}]",
                     (20, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.imshow(WINDOW_NAME, display)
+        writer.write(display)
 
         key = cv2.waitKey(1) & 0xFF
         if key in (27, ord("q")):
@@ -667,6 +719,7 @@ def main():
 
             if probation:
                 lost_frames += 1  # still mid lost-episode until confirmed -- keep the search clock running
+                frames_since_motion_fallback += 1  # ditto -- a TENTATIVE excursion must not pause this clock
                 if valid:
                     bad_count = 0
                     # Confirmation requires the RAISED bar (module docstring point
@@ -720,6 +773,7 @@ def main():
                     state = "LOST"
                     lost_frames = 0
                     search_abandoned = False
+                    frames_since_motion_fallback = 0
                     lcx, lcy = last_good_bbox[0] + last_good_bbox[2] / 2, last_good_bbox[1] + last_good_bbox[3] / 2
                     predicted_pos = (lcx, lcy)
                     lost_prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -727,6 +781,7 @@ def main():
                     print(f"Frame {frame_idx} | TRACKING->LOST | score={score:.3f} | bbox={bbox}")
         else:  # LOST -- motion-gated ORB search, tracker.update() not consulted
             lost_frames += 1
+            frames_since_motion_fallback += 1
             if lost_frames > MAX_LOST_FRAMES and not search_abandoned:
                 search_abandoned = True
                 print(f"Frame {frame_idx} | LOST search abandoned after {MAX_LOST_FRAMES} frames (TTL)")
@@ -793,6 +848,33 @@ def main():
                                   f"predicted=({pcx:.1f},{pcy:.1f}) | accepted=({ccx:.1f},{ccy:.1f}) | "
                                   f"dist={dist_from_pred:.1f} | radius={radius:.0f}")
 
+            # Motion-only fallback (see MOTION_FALLBACK_* docstring): ORB gets
+            # priority every frame above; only if it still hasn't found/held
+            # anything after a while do we periodically trust the motion
+            # prediction directly, entering the SAME probation safety net.
+            if (state == "LOST" and not search_abandoned and predicted_pos is not None
+                    and lost_frames >= MOTION_FALLBACK_MIN_LOST_FRAMES
+                    and frames_since_motion_fallback >= MOTION_FALLBACK_INTERVAL):
+                frames_since_motion_fallback = 0
+                pcx, pcy = predicted_pos
+                if VX0 <= pcx <= VX1 and 0 <= pcy <= height:
+                    half_b = args.box_size // 2
+                    fb_bbox = (int(round(pcx - half_b)), int(round(pcy - half_b)), args.box_size, args.box_size)
+                    if is_static_region(cleaned, prev_cleaned, fb_bbox):
+                        print(f"Frame {frame_idx} | LOST (motion-fallback static-region reject) | bbox={fb_bbox}")
+                    else:
+                        tracker = cv2.TrackerVit_create(params)
+                        tracker.init(cleaned, fb_bbox)
+                        state = "TRACKING"
+                        probation = True
+                        probation_count = 0
+                        bad_count = 0
+                        line_grace_remaining = 0
+                        bbox = fb_bbox
+                        n_transitions += 1
+                        print(f"Frame {frame_idx} | LOST->TENTATIVE (motion-only fallback) | "
+                              f"predicted=({pcx:.1f},{pcy:.1f}) | bbox={fb_bbox}")
+
         fps_frame_count += 1
         now = time.perf_counter()
         elapsed = now - fps_window_start
@@ -804,7 +886,9 @@ def main():
     print(f"Summary: {n_transitions} state transitions, {n_lost_frames}/{frame_idx} frames displayed as LOST, "
           f"{n_static_rejections} static-region rejections, {n_distance_rejections} distance-gate rejections")
     cap.release()
+    writer.release()
     cv2.destroyAllWindows()
+    print(f"Saved output video: {output_path}")
 
 
 if __name__ == "__main__":

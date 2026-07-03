@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 TRACKER_PLAN.md
 old_object_tracker.py
+outputs/
