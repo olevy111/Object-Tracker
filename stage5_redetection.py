@@ -159,11 +159,21 @@ CONFIRM_FRAMES = 20
 # it fails first, it's discarded and the next search resumes from the last
 # CONFIRMED position/appearance -- never from the failed guess.
 
-RECOVERY_SCORE_THRESHOLD = 0.45
+RECOVERY_SCORE_THRESHOLD = 0.42
 # Distinctly higher than SCORE_THRESHOLD (0.30, used to DECLARE loss).
 # Accepting a recovery at a score barely above the lost threshold (e.g. 0.38)
 # was measured to let weak, borderline matches through as if confirmed --
 # recovering needs a clearly healthier signal than merely-not-yet-lost.
+#
+# Tuned down from an initial 0.45 after tracing a genuine (visually verified
+# correct, smoothly continuous) recovery that took 226 frames to confirm --
+# its score naturally oscillated in the 0.4-0.6 range, and 0.45 meant it
+# rarely strung together CONFIRM_FRAMES in a row. At 0.42 the same trace
+# would have confirmed by frame 79 instead. This doesn't reopen the door to
+# the runaway-box false candidate found in the same test run: that one was
+# independently caught by the box-size sanity check (MAX_BBOX_AREA_FRAC)
+# regardless of score, so it never had CONFIRM_FRAMES of fully-valid frames
+# to begin with at any threshold.
 
 # -- Static-region rejection guard (ported from _is_static_region) --
 STATIC_DIFF_THRESHOLD = 2.0
