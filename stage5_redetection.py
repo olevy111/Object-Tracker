@@ -45,61 +45,67 @@ finishes before that degradation zone, not after it.
 
 Builds on Stage 3 (score-gated loss detection + hysteresis). Replaces the
 passive "keep calling tracker.update() and hope it stumbles back onto the
-object" behavior of Stages 3/4 with an ACTIVE search while LOST, modeled on
-a previously-working design for this exact repetitive-desert footage.
+object" behavior of Stages 3/4 with an ACTIVE search while LOST.
 
-Why ORB instead of cv2.matchTemplate (this replaces a first version of this
-stage that used matchTemplate): plain patch correlation floods with false
-positives on this footage's repetitive terrain -- measured, a matchTemplate
-version produced re-detected boxes jumping by hundreds/thousands of pixels
-between consecutive "recoveries", clearly locking onto look-alike ground.
-Distinctive ORB keypoint + descriptor matching (BFMatcher + knnMatch +
-Lowe's ratio test, requiring a minimum number of ratio-passing matches) is
-more discriminative because it requires a cluster of individually-
-distinctive local features to agree, not just one correlation peak.
-Calibration note: ORB's default edgeThreshold/patchSize (31) leaves NO
-valid detection area on a small (~40px) template -- it produced ZERO
-keypoints. Both are lowered to 7, and templates are cropped with extra
-padding for keypoint richness.
+REWORKED after a real false-positive bug: whole-frame ORB search was
+locking onto random look-alike patches of empty desert far from the real
+object (observed: a confirmed "recovery" sitting on blank terrain, nowhere
+near the object, with a merely-adequate score). The root cause is that an
+appearance-only search considers every location in the frame a candidate --
+on repetitive terrain there are always a few look-alike patches that score
+decently. The fix is not a better appearance metric; it's to stop
+considering far-away locations at all:
 
-Two-tier search, SEARCHING_LOCAL vs SEARCHING_GLOBAL:
-    - SEARCHING_LOCAL runs every LOST frame (cheap -- ORB only runs inside
-      a small ROI). The ROI is centered not on the stale last-known
-      position, but on a PREDICTED position: linear extrapolation of the
-      object's velocity (from its last 3 tracked positions) times how many
-      frames it's been lost -- if the object/camera has real motion, the
-      search center moves with it instead of searching where the object
-      USED to be. The ROI radius grows with elapsed lost-frame count
-      (not with failed attempts), capped at a max.
-    - After LOCAL_SEARCH_FRAMES frames without success, escalates to
-      SEARCHING_GLOBAL: the whole video-content region, throttled to once
-      every GLOBAL_SEARCH_INTERVAL frames to stay within the FPS budget
-      (full-frame ORB is more expensive than a small ROI).
-    - The frame is NOT downscaled for either tier -- ORB/BRIEF are only
-      mildly scale-tolerant, and downscaling a small object's already-
-      sparse keypoints collapses match counts further.
+1. Motion-predicted search region is now the PRIMARY filter. This footage's
+   camera motion is smooth and consistent (measured: ~13.5px/frame average,
+   std dx=4.8/dy=10.4, rotation std < 0.5 degrees -- real but bounded
+   frame-to-frame variance, not a clean constant velocity). Camera motion is
+   estimated every LOST frame via sparse-optical-flow + RANSAC (the Stage 4
+   GMC machinery) and used to propagate a predicted object position forward,
+   even while nothing is found. ORB search only ever runs inside a bounded
+   ROI around that prediction (radius growing with elapsed lost time, capped
+   well under frame size) -- there is no whole-frame search tier anymore.
+2. Every candidate is hard-gated on distance from the current prediction,
+   BEFORE its appearance score is even considered. A match far from where
+   the motion model says the object should be is rejected outright,
+   regardless of ORB match count -- this is what actually rejects a
+   look-alike patch, not the appearance score (measured: unrelated desert
+   patches can score plausible ORB match counts too).
+3. ORB keypoint/descriptor matching (BFMatcher + knnMatch + Lowe's ratio
+   test, ORB_MIN_MATCHES ratio-passing matches required) is still what
+   confirms appearance -- ported from old_object_tracker.py's
+   ReacquiringTracker (_orb_features / _match / _match_and_locate), which
+   measured ORB cross-matches between unrelated desert patches averaging
+   ~1.9, far below the 10-match bar, once the candidate pool is small (i.e.
+   once the motion gate has already done its job).
+4. The static-region (absdiff-vs-previous-frame) guard is unchanged --
+   ported from the same reference class (_is_static_region) -- rejects
+   pixel-identical-to-last-frame regions (the HUD/crosshair), regardless of
+   ORB score.
+5. The confidence bar to CONFIRM a recovery (RECOVERY_SCORE_THRESHOLD) is
+   set distinctly higher than the bar used to DECLARE loss
+   (SCORE_THRESHOLD) -- accepting a recovery at a score barely above the
+   lost threshold was too eager.
+6. While the predicted position is off-frame (a fully off-screen loss),
+   no matching is attempted at all -- there's nothing to find. Search
+   resumes, focused near the re-entry edge, only once the prediction
+   crosses back into frame bounds.
+7. The search is bounded by a TTL (MAX_LOST_FRAMES): if the object hasn't
+   been recovered by then, the system gives up gracefully (stays LOST,
+   stops spending cycles searching) rather than continuing indefinitely
+   and eventually accepting noise.
 
-Matching core (shared by both tiers): ORB features are matched against TWO
-saved templates -- an original anchor (fixed forever, from the initial
-click) and a periodically refreshed one (every ~30 confident-tracking
-frames), so a long occlusion or scale change doesn't strand the system on
-a stale template while the ground-truth original is never lost.
+Two saved templates (original anchor, fixed forever from the initial click;
+and a periodically refreshed one) are tried on every match attempt, ported
+from the same reference class, so a long occlusion or scale change doesn't
+strand the system on a stale template while the ground-truth original is
+never lost.
 
-Static-region rejection guard (critical safety gate): before accepting ANY
-candidate, however strong its ORB match, its region is compared against the
-SAME region in the previous frame via cv2.absdiff. If the mean difference
-is near zero, the candidate is pixel-static and rejected outright -- real
-scene content changes frame to frame (even subtly); a screen-locked HUD
-element (the timer, the RC/HD/Mbps/battery strip) does not. Calibrated on
-this footage: real terrain averages ~4.0 mean absdiff, the on-screen timer
-region averages ~1.1 -- a threshold of 2.0 cleanly separates them. Verified
-live: without this guard, ORB repeatedly re-locked onto the bottom-right
-HUD strip (same position recurring every attempt for 60+ frames straight).
-
-On finding a non-static, sufficiently-matched candidate (either tier), the
-tracker is fully re-initialized at that location immediately -- no extra
-multi-frame consistency wait on top of the match-count + static-region
-gates, matching the reference design this stage is modeled on.
+A re-detected candidate still starts on PROBATION (see CONFIRM_FRAMES
+below) rather than being trusted immediately -- the motion + distance gate
+makes false candidates far rarer, but probation is what stops a candidate
+that DOES pass every gate from silently overwriting the tracked object's
+identity if it doesn't hold up under continued tracking.
 
 Keys while playing:
     c  - toggle between showing the ORIGINAL and CLEANED stream
@@ -124,15 +130,17 @@ from stage3_loss_detection import (
     is_valid, draw_tracking,
     SCORE_THRESHOLD, LOST_N_FRAMES, RECOVER_N_FRAMES, MAX_BBOX_AREA_FRAC,
 )
+from stage4_gmc import build_flow_feature_mask, estimate_motion, GMC_DOWNSCALE
 
 BOX_SIZE = 40
-WINDOW_NAME = "Stage 5 - Re-detection (ORB)"
+WINDOW_NAME = "Stage 5 - Re-detection (ORB, motion-gated)"
 DEFAULT_MODEL = "models/object_tracking_vittrack_2023sep.onnx"
 
-# -- ORB matching --
+# -- ORB matching (ported from old_object_tracker.py's ReacquiringTracker) --
 ORB_NFEATURES = 500
-ORB_EDGE_THRESHOLD = 7   # default (31) leaves no valid area on a ~40-90px template -- see module docstring
-ORB_PATCH_SIZE = 7
+ORB_EDGE_THRESHOLD = 8    # default (31) leaves no valid area on a small template -- see module docstring
+ORB_PATCH_SIZE = 16
+MIN_ORB_CROP_SIZE = ORB_PATCH_SIZE * 2  # below this, ORB's internal pyramid can crash cv2.resize
 ORB_RATIO_TEST = 0.75
 ORB_MIN_MATCHES = 10
 ORB_TEMPLATE_PADDING = 25     # extra context (px) around the tracking box when cropping an ORB template;
@@ -141,27 +149,30 @@ TEMPLATE_REFRESH_FRAMES = 30  # refresh the "recent" template every N confident 
 
 # -- Re-detection probation (protects the original object's identity) --
 CONFIRM_FRAMES = 20
-# Why: ORB match count + the static-region guard aren't enough to guarantee a
-# re-detection is the SAME object on this repetitive terrain (measured: even
-# RANSAC geometric verification of the matched keypoints didn't cleanly
-# separate correct from unrelated regions -- see module docstring). The real
-# risk isn't a few wrong-looking frames; it's that a wrong candidate used to
-# get trusted IMMEDIATELY, overwriting last_good_bbox/pos_history/recent_orb
-# -- the system's only memory of where and what the real object was. From
-# then on, every subsequent search was centered on the wrong place and
-# matched against the wrong appearance: the real object's "identity" was
-# gone. Now a re-detected candidate starts on PROBATION: the tracker runs on
-# it, but last_good_bbox/pos_history/recent_orb are left untouched until it
-# survives CONFIRM_FRAMES consecutive valid frames. If it fails first
-# (common for false locks, which tend to collapse within a handful of
-# frames), it's discarded and the NEXT search resumes from the last
+# Why: even with the motion gate below, a candidate that passes every gate
+# isn't guaranteed correct. The real risk is a wrong candidate getting
+# trusted IMMEDIATELY, overwriting last_good_bbox/pos_history/recent_orb --
+# the system's only memory of where and what the real object was. A
+# re-detected candidate now starts on PROBATION: the tracker runs on it, but
+# nothing is overwritten until it survives CONFIRM_FRAMES consecutive valid
+# frames (using RECOVERY_SCORE_THRESHOLD, not the lower LOST threshold). If
+# it fails first, it's discarded and the next search resumes from the last
 # CONFIRMED position/appearance -- never from the failed guess.
 
-# -- Static-region rejection guard --
+RECOVERY_SCORE_THRESHOLD = 0.45
+# Distinctly higher than SCORE_THRESHOLD (0.30, used to DECLARE loss).
+# Accepting a recovery at a score barely above the lost threshold (e.g. 0.38)
+# was measured to let weak, borderline matches through as if confirmed --
+# recovering needs a clearly healthier signal than merely-not-yet-lost.
+
+# -- Static-region rejection guard (ported from _is_static_region) --
 STATIC_DIFF_THRESHOLD = 2.0
-# Calibrated on this footage: the on-screen timer region averages ~1.1 mean
+# Calibrated on THIS footage: the on-screen timer region averages ~1.1 mean
 # absdiff frame-to-frame (98% of frames below 2.0), while real terrain
-# averages ~4.0 (only 18% falsely below 2.0). See module docstring.
+# averages ~4.0 (only 18% falsely below 2.0) -- see module docstring. The
+# reference implementation used 4.0, calibrated on different footage; kept
+# at the value validated against this specific video instead of copied
+# blindly, since 4.0 here would falsely reject ~half of real terrain.
 
 # -- Stage 4.5: delayed init near the crosshair --
 NEAR_CROSSHAIR_RADIUS = 45   # px; a click within this distance of the crosshair center delays init
@@ -173,13 +184,20 @@ HOLD_MAX_CORNERS = 25
 MAX_HOLD_FRAMES = 90         # safety cap (~1.5s @ 60fps) so holding never waits forever if the
                               # camera barely moves or GMC repeatedly can't estimate motion
 
-# -- Two-tier search geometry --
-POS_HISTORY_LEN = 5              # tracked positions kept for velocity estimation
-LOCAL_SEARCH_BASE_RADIUS = 150   # px, local ROI half-width at the moment loss is declared
-LOCAL_SEARCH_RADIUS_GROWTH = 8   # px, ROI growth per elapsed LOST frame
-LOCAL_SEARCH_MAX_RADIUS = 500    # px, ROI half-width cap
-LOCAL_SEARCH_FRAMES = 45         # frames of local search before escalating to global
-GLOBAL_SEARCH_INTERVAL = 4       # throttle: run the global tier once every N LOST frames
+# -- Motion-gated search geometry (replaces the old two-tier local/global design) --
+POS_HISTORY_LEN = 5              # tracked positions kept for velocity fallback
+SEARCH_BASE_RADIUS = 100         # px, ROI half-width at the moment loss is declared
+SEARCH_RADIUS_GROWTH = 6         # px, ROI growth per elapsed LOST frame -- reflects growing
+                                  # uncertainty in the propagated motion prediction over time
+SEARCH_MAX_RADIUS = 300          # px, ROI half-width cap -- deliberately well under frame size
+                                  # (never a whole-frame search, see module docstring point 1)
+MAX_ACCEPT_DISTANCE = 320        # px, hard reject for any candidate farther than this from the
+                                  # CURRENT motion prediction, independent of appearance score
+                                  # (module docstring point 2) -- slightly above SEARCH_MAX_RADIUS
+                                  # only to avoid rejecting a legitimate match found right at the
+                                  # ROI's own edge/corner
+MAX_LOST_FRAMES = 200            # TTL: give up searching gracefully after this many LOST frames
+                                  # (module docstring point 7) rather than searching forever
 
 
 def make_orb():
@@ -213,6 +231,8 @@ def orb_locate(orb, bf, search_gray, template_entries, box_size, offset=(0, 0)):
     inflated size back into the next template crop compounds into a
     runaway growing box, the same failure shape as the Stage 2 degenerate
     full-frame lock)."""
+    if search_gray.shape[0] < MIN_ORB_CROP_SIZE or search_gray.shape[1] < MIN_ORB_CROP_SIZE:
+        return None, 0  # ORB's internal pyramid can crash cv2.resize below this size
     kp2, des2 = orb.detectAndCompute(search_gray, None)
     if des2 is None or len(des2) < 2:
         return None, 0
@@ -254,22 +274,37 @@ def is_static_region(curr_frame, prev_frame, bbox, threshold=STATIC_DIFF_THRESHO
     return float(cv2.absdiff(curr_region, prev_region).mean()) < threshold
 
 
+def is_valid_for_recovery(bbox, score, frame_area):
+    """Same box-size sanity check as stage3's is_valid(), but gated on
+    RECOVERY_SCORE_THRESHOLD instead of the lower SCORE_THRESHOLD used to
+    declare loss -- see module docstring point 5."""
+    if score < RECOVERY_SCORE_THRESHOLD:
+        return False
+    x, y, w, h = bbox
+    if w <= 0 or h <= 0:
+        return False
+    return (w * h) <= MAX_BBOX_AREA_FRAC * frame_area
+
+
 def estimate_velocity(pos_history):
     """Velocity (px/frame) from the first and last of the last 3 tracked
-    positions. Returns (0, 0) until enough history has accumulated."""
+    positions just before loss. Returns (0, 0) until enough history has
+    accumulated. Used only as a one-frame fallback increment for
+    `predicted_pos` on a frame where the GMC motion estimate itself is
+    unavailable (too few flow features) -- the primary predictor is the
+    continuous GMC propagation in main()."""
     if len(pos_history) < 3:
         return 0.0, 0.0
     (x0, y0), (x1, y1) = pos_history[-3], pos_history[-1]
     return (x1 - x0) / 2.0, (y1 - y0) / 2.0
 
 
-def predicted_center(pos_history, lost_frames):
-    """Linear extrapolation of the last known position by `lost_frames`
-    steps of the estimated velocity -- keeps the local search ROI centered
-    on where the object should be NOW, not where it was last seen."""
-    cx, cy = pos_history[-1]
-    vx, vy = estimate_velocity(pos_history)
-    return cx + vx * lost_frames, cy + vy * lost_frames
+def transform_point(pt, M):
+    """Map a single (x, y) point through affine matrix M (as returned by
+    estimate_motion: previous-frame position -> current-frame position)."""
+    arr = np.array([[pt]], dtype=np.float32)
+    warped = cv2.transform(arr, M)
+    return float(warped[0, 0, 0]), float(warped[0, 0, 1])
 
 
 def find_hold_corners(gray1, point, overlay_mask, neighborhood=HOLD_CORNER_NEIGHBORHOOD,
@@ -314,10 +349,14 @@ def draw_holding(frame, held_point, hold_frames, dist_to_crosshair, color=(0, 20
     return frame
 
 
-def draw_lost_orb(frame, last_good_bbox, n_matches, mode, color=(0, 0, 255), dim_color=(120, 120, 120)):
+def draw_lost_orb(frame, last_good_bbox, n_matches, mode, predicted_pos=None,
+                   color=(0, 0, 255), dim_color=(120, 120, 120), pred_color=(255, 0, 255)):
     if last_good_bbox is not None:
         x, y, w, h = [int(v) for v in last_good_bbox]
         cv2.rectangle(frame, (x, y), (x + w, y + h), dim_color, 1)
+    if predicted_pos is not None:
+        px, py = int(predicted_pos[0]), int(predicted_pos[1])
+        cv2.drawMarker(frame, (px, py), pred_color, markerType=cv2.MARKER_CROSS, markerSize=18, thickness=2)
     cv2.putText(frame, f"LOST [{mode}]  orb_matches={n_matches}", (20, 80),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
     return frame
@@ -365,6 +404,9 @@ def main():
     print(f"Resolution: {width}x{height}, source FPS: {src_fps:.2f}")
 
     cleaner = OverlayCleaner(width, height)
+    flow_mask = build_flow_feature_mask(width, height, cleaner.full_mask)
+    flow_mask_small = cv2.resize(flow_mask, None, fx=1 / GMC_DOWNSCALE, fy=1 / GMC_DOWNSCALE,
+                                  interpolation=cv2.INTER_NEAREST)
 
     ok, frame1 = cap.read()
     if not ok:
@@ -407,6 +449,11 @@ def main():
     n_lost_frames = 0
     n_transitions = 0
     n_static_rejections = 0
+    n_distance_rejections = 0
+
+    predicted_pos = None
+    lost_prev_gray = None
+    search_abandoned = False
 
     tracker = None
     orig_orb = (None, None)
@@ -468,7 +515,7 @@ def main():
         elif state == "HOLDING":
             draw_holding(display, held_point, hold_frames, math.hypot(held_point[0] - CX, held_point[1] - CY))
         else:
-            draw_lost_orb(display, last_good_bbox, match_count_display, search_mode_display)
+            draw_lost_orb(display, last_good_bbox, match_count_display, search_mode_display, predicted_pos)
             n_lost_frames += 1
 
         stream_label = "CLEANED" if show_cleaned else "ORIGINAL"
@@ -493,6 +540,24 @@ def main():
 
         prev_cleaned = cleaned
         cleaned = cleaner.clean(frame)
+
+        # Motion prediction keeps propagating on EVERY frame we don't yet fully
+        # trust -- both while LOST and while a re-detected candidate is still on
+        # PROBATION (module docstring point 1) -- so if a tentative lock fails,
+        # the next search resumes from an up-to-date prediction, not a stale one.
+        uncertain = (state == "LOST") or (state == "TRACKING" and probation)
+        if uncertain and lost_prev_gray is not None and predicted_pos is not None:
+            curr_gray_gmc = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            motion_M, _ = estimate_motion(lost_prev_gray, curr_gray_gmc, flow_mask_small)
+            if motion_M is not None:
+                predicted_pos = transform_point(predicted_pos, motion_M)
+            else:
+                # GMC couldn't estimate motion this frame (too few flow features) --
+                # fall back to a one-frame step of the object's last known velocity
+                # rather than freezing the prediction in place.
+                vx, vy = estimate_velocity(pos_history)
+                predicted_pos = (predicted_pos[0] + vx, predicted_pos[1] + vy)
+            lost_prev_gray = curr_gray_gmc
 
         if state == "HOLDING":
             curr_gray_hold = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -533,7 +598,14 @@ def main():
                 lost_frames += 1  # still mid lost-episode until confirmed -- keep the search clock running
                 if valid:
                     bad_count = 0
-                    probation_count += 1
+                    # Confirmation requires the RAISED bar (module docstring point
+                    # 5), not merely the lower threshold that avoids declaring LOST
+                    # -- a sane-but-weak frame doesn't advance the confirmation
+                    # clock, but doesn't fail the candidate outright either.
+                    if is_valid_for_recovery(bbox, score, frame_area):
+                        probation_count += 1
+                    else:
+                        probation_count = 0
                     if probation_count >= CONFIRM_FRAMES:
                         probation = False
                         last_good_bbox = bbox
@@ -543,7 +615,7 @@ def main():
                         if refreshed_gray is not None:
                             recent_orb = orb.detectAndCompute(refreshed_gray, None)
                         frames_since_refresh = 0
-                        print(f"Frame {frame_idx} | TENTATIVE->TRACKING (confirmed) | bbox={bbox}")
+                        print(f"Frame {frame_idx} | TENTATIVE->TRACKING (confirmed) | bbox={bbox} | score={score:.3f}")
                 else:
                     bad_count += 1
                     probation_count = 0
@@ -571,60 +643,78 @@ def main():
                 if bad_count >= args.lost_n:
                     state = "LOST"
                     lost_frames = 0
+                    search_abandoned = False
+                    lcx, lcy = last_good_bbox[0] + last_good_bbox[2] / 2, last_good_bbox[1] + last_good_bbox[3] / 2
+                    predicted_pos = (lcx, lcy)
+                    lost_prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                     n_transitions += 1
                     print(f"Frame {frame_idx} | TRACKING->LOST | score={score:.3f} | bbox={bbox}")
-        else:  # LOST -- active ORB search, tracker.update() not consulted
+        else:  # LOST -- motion-gated ORB search, tracker.update() not consulted
             lost_frames += 1
-            use_global = lost_frames > LOCAL_SEARCH_FRAMES
-            search_mode_display = "GLOBAL" if use_global else "LOCAL"
+            if lost_frames > MAX_LOST_FRAMES and not search_abandoned:
+                search_abandoned = True
+                print(f"Frame {frame_idx} | LOST search abandoned after {MAX_LOST_FRAMES} frames (TTL)")
 
-            run_this_frame = True
-            if use_global and lost_frames % GLOBAL_SEARCH_INTERVAL != 0:
-                run_this_frame = False
-
-            candidate_bbox = None
-            n_matches = 0
-            if run_this_frame:
-                gray = cv2.cvtColor(cleaned, cv2.COLOR_BGR2GRAY)
-                if use_global:
-                    rx0, ry0, rx1, ry1 = VX0, 0, VX1, height
+            match_count_display = 0
+            if search_abandoned or predicted_pos is None:
+                search_mode_display = "ABANDONED" if search_abandoned else "-"
+            else:
+                pcx, pcy = predicted_pos
+                if not (VX0 <= pcx <= VX1 and 0 <= pcy <= height):
+                    # Fully off-frame loss (module docstring point 6) -- nothing to
+                    # find while the motion model says the object is off-screen;
+                    # keep propagating the prediction but don't spend cycles matching.
+                    search_mode_display = "OFF-FRAME"
                 else:
-                    radius = min(LOCAL_SEARCH_BASE_RADIUS + lost_frames * LOCAL_SEARCH_RADIUS_GROWTH,
-                                 LOCAL_SEARCH_MAX_RADIUS)
-                    pcx, pcy = predicted_center(pos_history, lost_frames)
+                    search_mode_display = "LOCAL"
+                    radius = min(SEARCH_BASE_RADIUS + lost_frames * SEARCH_RADIUS_GROWTH, SEARCH_MAX_RADIUS)
                     rx0 = int(max(VX0, pcx - radius))
                     ry0 = int(max(0, pcy - radius))
                     rx1 = int(min(VX1, pcx + radius))
                     ry1 = int(min(height, pcy + radius))
-                search_region = gray[ry0:ry1, rx0:rx1]
+                    gray = cv2.cvtColor(cleaned, cv2.COLOR_BGR2GRAY)
+                    search_region = gray[ry0:ry1, rx0:rx1]
 
-                if search_region.shape[0] > 8 and search_region.shape[1] > 8:
-                    candidate_bbox, n_matches = orb_locate(
-                        orb, bf, search_region, [orig_orb, recent_orb],
-                        box_size=(args.box_size, args.box_size), offset=(rx0, ry0))
+                    candidate_bbox, n_matches = None, 0
+                    if search_region.shape[0] >= MIN_ORB_CROP_SIZE and search_region.shape[1] >= MIN_ORB_CROP_SIZE:
+                        candidate_bbox, n_matches = orb_locate(
+                            orb, bf, search_region, [orig_orb, recent_orb],
+                            box_size=(args.box_size, args.box_size), offset=(rx0, ry0))
+                    match_count_display = n_matches
 
-            match_count_display = n_matches
+                    if candidate_bbox is not None:
+                        ccx = candidate_bbox[0] + candidate_bbox[2] / 2
+                        ccy = candidate_bbox[1] + candidate_bbox[3] / 2
+                        dist_from_pred = math.hypot(ccx - pcx, ccy - pcy)
 
-            if candidate_bbox is not None:
-                if is_static_region(cleaned, prev_cleaned, candidate_bbox):
-                    n_static_rejections += 1
-                    print(f"Frame {frame_idx} | LOST (static-region reject) | matches={n_matches} | "
-                          f"bbox={tuple(round(v, 1) for v in candidate_bbox)}")
-                else:
-                    # Enter PROBATION -- do NOT touch last_good_bbox / pos_history /
-                    # recent_orb yet. If this candidate is wrong, the next search
-                    # attempt must still start from the last CONFIRMED position and
-                    # appearance, not from this guess (see CONFIRM_FRAMES docstring).
-                    tracker = cv2.TrackerVit_create(params)
-                    tracker.init(cleaned, tuple(int(round(v)) for v in candidate_bbox))
-                    state = "TRACKING"
-                    probation = True
-                    probation_count = 0
-                    bad_count = 0
-                    bbox = candidate_bbox
-                    n_transitions += 1
-                    print(f"Frame {frame_idx} | LOST->TENTATIVE (re-detected, unconfirmed) | matches={n_matches} | "
-                          f"bbox={tuple(round(v, 1) for v in candidate_bbox)} | mode={search_mode_display}")
+                        if dist_from_pred > MAX_ACCEPT_DISTANCE:
+                            # Hard motion gate (module docstring point 2) -- rejected
+                            # BEFORE appearance is even considered further, regardless
+                            # of how many ORB matches it had.
+                            n_distance_rejections += 1
+                            print(f"Frame {frame_idx} | LOST (distance-gate reject) | matches={n_matches} | "
+                                  f"predicted=({pcx:.1f},{pcy:.1f}) | candidate=({ccx:.1f},{ccy:.1f}) | "
+                                  f"dist={dist_from_pred:.1f} > {MAX_ACCEPT_DISTANCE}")
+                        elif is_static_region(cleaned, prev_cleaned, candidate_bbox):
+                            n_static_rejections += 1
+                            print(f"Frame {frame_idx} | LOST (static-region reject) | matches={n_matches} | "
+                                  f"bbox={tuple(round(v, 1) for v in candidate_bbox)}")
+                        else:
+                            # Enter PROBATION -- do NOT touch last_good_bbox / pos_history /
+                            # recent_orb yet. If this candidate is wrong, the next search
+                            # attempt must still start from the last CONFIRMED position and
+                            # appearance, not from this guess (see CONFIRM_FRAMES docstring).
+                            tracker = cv2.TrackerVit_create(params)
+                            tracker.init(cleaned, tuple(int(round(v)) for v in candidate_bbox))
+                            state = "TRACKING"
+                            probation = True
+                            probation_count = 0
+                            bad_count = 0
+                            bbox = candidate_bbox
+                            n_transitions += 1
+                            print(f"Frame {frame_idx} | LOST->TENTATIVE (re-detected, unconfirmed) | matches={n_matches} | "
+                                  f"predicted=({pcx:.1f},{pcy:.1f}) | accepted=({ccx:.1f},{ccy:.1f}) | "
+                                  f"dist={dist_from_pred:.1f} | radius={radius:.0f}")
 
         fps_frame_count += 1
         now = time.perf_counter()
@@ -635,7 +725,7 @@ def main():
             fps_window_start = now
 
     print(f"Summary: {n_transitions} state transitions, {n_lost_frames}/{frame_idx} frames displayed as LOST, "
-          f"{n_static_rejections} static-region rejections")
+          f"{n_static_rejections} static-region rejections, {n_distance_rejections} distance-gate rejections")
     cap.release()
     cv2.destroyAllWindows()
 
