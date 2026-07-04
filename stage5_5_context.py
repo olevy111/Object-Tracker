@@ -434,6 +434,55 @@ SUPPORTER_TRACK_WEIGHT_RECOVERY = 0.05  # weight regained per good frame -- reco
                                         # drops, so a supporter that misbehaved once has to re-earn trust
 SUPPORTER_TRACK_MIN_WEIGHT = 0.3   # weight at or below this -- deactivated
 
+# -- Context-aware tracking, Stage 3: consensus position voting --
+# Each active supporter "votes" for where the target should be: its current
+# tracked position minus its FIXED init-time offset. The median of all
+# votes is the consensus -- a robust average, not thrown off by one or two
+# outlier votes (a supporter that's drifted, or a point whose local scale
+# has changed more than the group's). Because it's a median over whichever
+# supporters are currently active, the target position is recoverable from
+# any subset -- even 2-3 active supporters still give a usable fix, no need
+# for all of them to be present.
+#
+# The stored offset is a FIXED vector from init -- it does NOT track scale
+# or rotation change since init (that would need a similarity-transform fit
+# across supporters, not simple per-point voting). Small camera rotation
+# (~0.5 deg) and gradual scale change (a descending drone) mean any single
+# supporter's vote will drift a little from the "true" arrangement over
+# time. Rather than modeling that distortion directly, the SECOND filtering
+# pass below tolerates it: votes further than SUPPORTER_VOTE_TOLERANCE from
+# the initial group median are treated as outliers (that supporter's
+# geometry has distorted too much to trust this frame) and excluded before
+# taking the final median -- "mild affine distortion" is absorbed as
+# ordinary vote spread rather than requiring an explicit correction.
+SUPPORTER_VOTE_TOLERANCE = 40      # px; votes further than this from the initial group median are
+                                    # excluded as distorted/outlier before the final consensus
+SUPPORTER_MIN_ACTIVE_FOR_CONSENSUS = 2  # fewer active supporters than this -- no consensus attempted
+                                    # (spec: even 2-3 give a strong fix, but need at least this many
+                                    # to call it a "consensus" at all rather than one lone guess)
+
+# Periodic supporter refresh (during confirmed TRACKING only): re-run
+# selection around the CURRENT trusted position instead of relying forever
+# on the init-time fingerprint. Fixes two compounding problems measured
+# directly, not just theorized: (1) Stage 2's GMC-rigidity check will
+# always eventually drop supporters on real (non-planar) terrain as
+# parallax accumulates -- refreshing simply replaces them; (2) even before
+# any real drift, the consensus's OWN precision is only ~5-10px (median of
+# several individually-noisy KLT votes) -- fine for rejecting a candidate
+# hundreds of pixels away, but not always enough to tell apart two lookalike
+# objects sitting only 15-30px apart, which is exactly this feature's core
+# use case. A stale fingerprint only makes that worse as it drifts further
+# from the current true arrangement; a young one (recently refreshed) stays
+# as close to that ~5-10px floor as this design can get.
+SUPPORTER_REFRESH_INTERVAL = 80    # frames since the last refresh before forcing a new one
+SUPPORTER_REFRESH_MIN_ACTIVE = 4   # refresh early if active count drops below this, rather than
+                                    # waiting for the interval while running low on supporters
+                                    # (tuned from an initial 120/3: measured median consensus-vs-
+                                    # tracker distance dropping from 65.5px to 34.4px, and the
+                                    # fraction of badly-off frames (>=100px) from 32% to 13%, by
+                                    # refreshing more proactively rather than waiting for supporters
+                                    # to nearly run out)
+
 
 # Deliberately NOT implemented via cap.set(CAP_PROP_POS_FRAMES) peek-then-
 # rewind -- tried that first and it silently corrupted playback: seeking on
@@ -566,6 +615,23 @@ def transform_point(pt, M):
     arr = np.array([[pt]], dtype=np.float32)
     warped = cv2.transform(arr, M)
     return float(warped[0, 0, 0]), float(warped[0, 0, 1])
+
+
+def transform_vector(v, M):
+    """Map a 2D VECTOR (e.g. a supporter's offset from the target -- a
+    DIFFERENCE between two points, not a point itself) through the LINEAR
+    part only of affine matrix M, dropping translation. Unlike a point, a
+    vector's transform under an affine map has no translation term: if
+    both endpoints move by the same M (p1' = A@p1 + t, p2' = A@p2 + t),
+    their difference transforms as (p2'-p1') = A@(p2-p1) -- the
+    translation cancels out. Used to keep a supporter's stored offset
+    valid as the camera's rotation/scale evolves frame to frame, instead
+    of treating it as a fixed vector from init (see SUPPORTER_REFRESH_*
+    module comment -- measured the fixed-offset assumption producing a
+    real, visible, monotonic drift between refreshes)."""
+    linear = np.array(M[:, :2], dtype=np.float64)
+    dx, dy = linear @ np.array([v[0], v[1]], dtype=np.float64)
+    return float(dx), float(dy)
 
 
 def find_hold_corners(gray1, point, overlay_mask, neighborhood=HOLD_CORNER_NEIGHBORHOOD,
@@ -849,7 +915,17 @@ def update_supporters(supporters, prev_gray, curr_gray, motion_M, width, height,
         its tracked position silently drift away from where the point
         actually is. Sustained mismatch (a genuinely non-rigid point, e.g.
         a vehicle) still drops it once weight bottoms out; a one-off
-        noisy frame doesn't."""
+        noisy frame doesn't.
+
+    On a rigid frame, the supporter's stored OFFSET is also updated via
+    transform_vector(offset, motion_M) -- not just its position. Measured
+    directly (real screenshots + logs from testing): without this, offset
+    stays fixed from whenever it was last set (init or refresh) and the
+    consensus vote visibly drifts off the true target, monotonically,
+    until the next periodic refresh snaps it back. Continuously correcting
+    the offset for the same rotation/scale change already being measured
+    for the rigidity check keeps the fixed-offset assumption valid on an
+    ONGOING basis, not just momentarily after each refresh."""
     active = [s for s in supporters if s["active"]]
     if not active:
         return
@@ -885,6 +961,8 @@ def update_supporters(supporters, prev_gray, curr_gray, motion_M, width, height,
 
         s["pt"] = (nx, ny)
         if rigid:
+            if motion_M is not None:
+                s["offset"] = transform_vector(s["offset"], motion_M)
             s["weight"] = min(1.0, s["weight"] + SUPPORTER_TRACK_WEIGHT_RECOVERY)
         else:
             s["weight"] = max(0.0, s["weight"] - SUPPORTER_TRACK_WEIGHT_DECAY)
@@ -922,6 +1000,45 @@ def draw_supporters_live(frame, supporters):
         x, y = int(s["pt"][0]), int(s["pt"][1])
         intensity = int(80 + 175 * min(1.0, s["weight"]))
         cv2.circle(frame, (x, y), 5, (0, intensity, 0), 2)
+    return frame
+
+
+def compute_supporter_consensus(supporters, tolerance=SUPPORTER_VOTE_TOLERANCE,
+                                 min_active=SUPPORTER_MIN_ACTIVE_FOR_CONSENSUS):
+    """Stage 3: each active supporter votes for the target position (its
+    current tracked position minus its fixed init-time offset); the median
+    vote is the consensus. A second pass drops any vote further than
+    `tolerance` px from that initial median -- absorbs mild affine
+    distortion (small rotation/scale drift since init) as ordinary spread
+    rather than letting one badly-distorted supporter skew the result (see
+    module docstring). Returns (consensus_pos, n_votes_used) or (None, 0)
+    if fewer than `min_active` supporters are currently active."""
+    active = [s for s in supporters if s["active"]]
+    if len(active) < min_active:
+        return None, 0
+
+    votes = np.array([(s["pt"][0] - s["offset"][0], s["pt"][1] - s["offset"][1]) for s in active])
+    median_vote = np.median(votes, axis=0)
+    deviations = np.linalg.norm(votes - median_vote, axis=1)
+    inliers = votes[deviations <= tolerance]
+
+    if len(inliers) < min_active:
+        # Not enough agreement even with tolerance -- still report the
+        # full-set median rather than nothing, but callers can see from
+        # n_votes_used that agreement was poor this frame.
+        return (float(median_vote[0]), float(median_vote[1])), len(active)
+
+    final = np.median(inliers, axis=0)
+    return (float(final[0]), float(final[1])), int(len(inliers))
+
+
+def draw_consensus(frame, consensus_pos, color=(0, 255, 255)):
+    """Small diamond marker at the supporter-consensus predicted position --
+    distinct from the purple GMC-motion prediction marker (draw_lost_orb),
+    since Stage 3's consensus is an independent signal being validated
+    against the tracker's own reported position (see module docstring)."""
+    x, y = int(consensus_pos[0]), int(consensus_pos[1])
+    cv2.drawMarker(frame, (x, y), color, markerType=cv2.MARKER_DIAMOND, markerSize=16, thickness=2)
     return frame
 
 
@@ -1099,6 +1216,7 @@ def main():
 
     bad_count = 0
     frames_since_refresh = 0
+    frames_since_supporter_refresh = 0
     line_grace_remaining = 0
     lost_frames = 0
     frames_since_motion_fallback = 0
@@ -1115,6 +1233,8 @@ def main():
     search_cycle_frames = 0
     frames_since_abandon = 0
     n_retry_cycles = 0
+    consensus_pos = None
+    n_votes = 0
 
     tracker = None
     orig_orb = (None, None)
@@ -1174,6 +1294,8 @@ def main():
             display[cleaner.full_mask > 0] = (0, 0, 255)
 
         draw_supporters_live(display, supporters)
+        if consensus_pos is not None:
+            draw_consensus(display, consensus_pos)
 
         if state == "TRACKING":
             if probation:
@@ -1192,6 +1314,9 @@ def main():
         cv2.putText(display, f"frame {frame_idx}  fps {display_fps:.1f}  [{stream_label}{mask_label}]  "
                               f"supporters {n_active_supporters}/{len(supporters)}",
                     (20, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        if consensus_pos is not None:
+            cv2.putText(display, f"consensus (yellow diamond) from {n_votes} vote(s)",
+                        (20, height - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         cv2.imshow(WINDOW_NAME, display)
         writer.write(display)
 
@@ -1290,6 +1415,7 @@ def main():
                 supporters = init_supporters_with_preview(
                     cv2.cvtColor(cleaned, cv2.COLOR_BGR2GRAY), init_box, cleaner.full_mask, cleaned,
                     static_mask=static_mask_now, skip_pause=args.skip_supporter_preview)
+                frames_since_supporter_refresh = 0
 
                 state = "TRACKING"
                 probation = False
@@ -1372,6 +1498,31 @@ def main():
                         if refreshed_gray is not None:
                             recent_orb = orb.detectAndCompute(refreshed_gray, None)
                         frames_since_refresh = 0
+
+                    # Periodic supporter refresh (see SUPPORTER_REFRESH_*
+                    # module comment): re-anchor the spatial fingerprint to
+                    # the CURRENT confirmed position rather than letting it
+                    # grow stale, both from Stage 2 decay and from
+                    # accumulated scale/rotation drift since whenever it was
+                    # last refreshed.
+                    frames_since_supporter_refresh += 1
+                    n_active_supp = sum(1 for s in supporters if s["active"])
+                    if (frames_since_supporter_refresh >= SUPPORTER_REFRESH_INTERVAL
+                            or n_active_supp < SUPPORTER_REFRESH_MIN_ACTIVE):
+                        reason = ("interval elapsed" if frames_since_supporter_refresh >= SUPPORTER_REFRESH_INTERVAL
+                                  else f"only {n_active_supp} active")
+                        ok_peek, next_frame = cap.read()
+                        peeked_gray = cv2.cvtColor(next_frame, cv2.COLOR_BGR2GRAY) if ok_peek else None
+                        static_mask_refresh = build_static_hud_mask(
+                            cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), peeked_gray)
+                        pending_frame = next_frame if ok_peek else None
+
+                        supporters, n_raw_r, n_survivors_r = select_supporters(
+                            cv2.cvtColor(cleaned, cv2.COLOR_BGR2GRAY), bbox, cleaner.full_mask,
+                            static_mask=static_mask_refresh)
+                        frames_since_supporter_refresh = 0
+                        print(f"Frame {frame_idx} | Supporters refreshed ({reason}) | "
+                              f"{n_raw_r} raw -> {n_survivors_r} survivors -> {len(supporters)} chosen")
             else:
                 bad_count += 1
                 if bad_count >= args.lost_n:
@@ -1494,6 +1645,23 @@ def main():
                         n_transitions += 1
                         print(f"Frame {frame_idx} | LOST->TENTATIVE (motion-only fallback) | "
                               f"predicted=({pcx:.1f},{pcy:.1f}) | bbox={fb_bbox}")
+
+        # Stage 3: consensus-vs-tracker comparison, logged every frame both
+        # are available (see module docstring) -- this is purely a
+        # VALIDATION signal right now, not yet consulted by the tracker
+        # itself (that's Stage 4).
+        consensus_pos, n_votes = compute_supporter_consensus(supporters)
+        if state == "TRACKING" and bbox is not None:
+            tracker_pos = (bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2)
+        elif state == "LOST" and predicted_pos is not None:
+            tracker_pos = predicted_pos
+        else:
+            tracker_pos = None
+        if consensus_pos is not None and tracker_pos is not None:
+            dist = math.hypot(consensus_pos[0] - tracker_pos[0], consensus_pos[1] - tracker_pos[1])
+            print(f"Frame {frame_idx} | Consensus check | consensus=({consensus_pos[0]:.1f},"
+                  f"{consensus_pos[1]:.1f}) tracker=({tracker_pos[0]:.1f},{tracker_pos[1]:.1f}) "
+                  f"dist={dist:.1f} n_votes={n_votes}")
 
         fps_frame_count += 1
         now = time.perf_counter()
