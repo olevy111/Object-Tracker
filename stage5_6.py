@@ -634,6 +634,65 @@ CONSENSUS_RELIABILITY_SMOOTHING_WINDOW = 5  # frames averaged to get the SMOOTHE
                                     # Averaging over a short window smooths that noise out while still
                                     # reflecting a genuine, sustained reliability trend.
 
+# -- Stage 5.6, Option 2: let strong, sustained consensus agreement confirm
+# a TENTATIVE candidate on its own, alongside VitTrack's own score (Option 1
+# only changed WHERE the fused position lands during probation; this changes
+# WHEN probation ends). This is a SEPARATE, additive path to confirmation --
+# it never disables or replaces the existing CONFIRM_FRAMES/score path above,
+# it just gives a strongly-corroborated candidate a second, faster way out of
+# probation. Deliberately stricter than the fusion guard's "clearly better"
+# margin test: this decision overwrites last_good_bbox/pos_history/recent_orb
+# (the system's only memory of the real object -- see CONFIRM_FRAMES
+# docstring), so it demands real AGREEMENT (a tight distance, not just
+# "closer than VitTrack") from a consensus that is itself highly reliable,
+# not merely more reliable than a weak VitTrack score.
+CONSENSUS_CONFIRM_MIN_RELIABILITY = 0.60  # consensus itself must be strongly reliable (high vote
+                                    # agreement + count), not just "better than a shaky VitTrack" --
+                                    # this confirms an identity, not a single frame's position
+CONSENSUS_CONFIRM_MAX_DIST = 30      # px; tighter than the fusion guard's disagreement thresholds
+                                    # (40-60px) on purpose -- that guard looks for disagreement to
+                                    # correct, this looks for agreement to confirm
+CONSENSUS_CONFIRM_FRAMES = 10        # half of CONFIRM_FRAMES=20 -- "confirms faster" per the request,
+                                    # but still a real sustained streak given the stakes (overwrites
+                                    # the tracker's only memory of the confirmed object)
+
+# -- Stage 5.6, distinctiveness prior: a soft, continuous BIAS on the
+# per-frame reliability weights, not a mode switch. The per-frame weights
+# (vit_reliability/orb_reliability/consensus_reliability/gmc_reliability)
+# already adapt automatically every frame based on real evidence (a
+# feature-rich object naturally yields high ORB/VitTrack scores; a faint one
+# naturally doesn't) -- that mechanism is untouched and still governs. This
+# prior only nudges the STARTING point right at init/re-detection/refresh,
+# before enough frame-to-frame evidence has accumulated to fully judge it on
+# its own, then fades out smoothly as real evidence takes over -- it never
+# clamps or overrides what the per-frame weights measure.
+DISTINCTIVENESS_KP_SATURATION = 150    # ORB keypoint count (in the padded template context -- see
+                                    # ORB_TEMPLATE_PADDING docstring: a bare box alone yields too few
+                                    # keypoints to be meaningful) at which the keypoint half of the
+                                    # distinctiveness score saturates to 1.0. Recalibrated from an
+                                    # initial guess of 40 after measuring real keypoint counts across 6
+                                    # test points on track-train.mp4: 12, 87, 90, 143, 171, 214 -- at 40,
+                                    # 5 of 6 points saturated to 1.0 and the keypoint half of the score
+                                    # barely discriminated between them; 150 spreads the typical range
+                                    # while still saturating the most feature-rich cases.
+DISTINCTIVENESS_CONTRAST_SCALE = 6    # intensity contrast (0-255 gray levels) between the object box
+                                    # and its immediate background ring at which the contrast half of
+                                    # the distinctiveness score saturates to 1.0. Recalibrated from an
+                                    # initial guess of 25 after measuring real contrast across the same
+                                    # 6 points: 2.2-8.0 -- at 25 everything compressed into a narrow
+                                    # 0.09-0.32 band; 6 uses the actually-observed range.
+                                    # NOTE: both constants were calibrated on ONE video (track-train.mp4,
+                                    # all points on the same object) -- re-validate once a genuinely
+                                    # faint/low-texture-object video is available; a real low-contrast
+                                    # case may fall outside this observed range.
+DISTINCTIVENESS_PRIOR_STRENGTH = 0.15  # max reliability shift (+/-) the prior can apply, at distinctiveness
+                                    # 0.0 or 1.0, before any decay -- deliberately modest: this is a
+                                    # bias on the STARTING point, not a replacement for real evidence
+DISTINCTIVENESS_PRIOR_HALF_LIFE = 15  # frames; how fast the prior's influence decays as real per-frame
+                                    # evidence accumulates -- same half-life-decay pattern already used
+                                    # for GMC_RELIABILITY_DECAY_HALF_LIFE, for the same reason (a smooth,
+                                    # continuous fade, never an abrupt cutover)
+
 
 # Deliberately NOT implemented via cap.set(CAP_PROP_POS_FRAMES) peek-then-
 # rewind -- tried that first and it silently corrupted playback: seeking on
@@ -813,6 +872,54 @@ def crop_orb_template(frame, bbox, padding=ORB_TEMPLATE_PADDING):
     return cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
 
 
+def measure_target_distinctiveness(frame, bbox, orb_detector, padding=ORB_TEMPLATE_PADDING):
+    """Init-time-only measurement of the target's intrinsic distinctiveness:
+    ORB keypoint count in the padded template context (the same crop the
+    re-detection matcher itself uses -- a bare box alone yields too few
+    keypoints to be meaningful, see ORB_TEMPLATE_PADDING), and intensity
+    contrast between the object box and the padding ring immediately around
+    it. Returns (distinctiveness in [0,1], n_keypoints, contrast). This
+    feeds ONLY the init-time prior (a bias) -- never a per-frame reliability
+    signal on its own, and never a basis for a discrete object-type switch."""
+    x, y, w, h = [int(round(v)) for v in bbox]
+    if w <= 0 or h <= 0:
+        return 0.5, 0, 0.0  # neutral prior -- nothing to measure on a degenerate box
+
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(frame.shape[1], x + w), min(frame.shape[0], y + h)
+    px0, py0 = max(0, x0 - padding), max(0, y0 - padding)
+    px1, py1 = min(frame.shape[1], x1 + padding), min(frame.shape[0], y1 + padding)
+    if x1 <= x0 or y1 <= y0 or px1 <= px0 or py1 <= py0:
+        return 0.5, 0, 0.0
+
+    template = cv2.cvtColor(frame[py0:py1, px0:px1], cv2.COLOR_BGR2GRAY)
+    n_kp = len(orb_detector.detect(template, None))
+
+    inner_mask = np.zeros(template.shape, dtype=bool)
+    inner_mask[(y0 - py0):(y1 - py0), (x0 - px0):(x1 - px0)] = True
+    inner_pixels = template[inner_mask]
+    ring_pixels = template[~inner_mask]
+    contrast = (abs(float(inner_pixels.mean()) - float(ring_pixels.mean()))
+                if inner_pixels.size > 0 and ring_pixels.size > 0 else 0.0)
+
+    kp_score = clip01(n_kp / DISTINCTIVENESS_KP_SATURATION)
+    contrast_score = clip01(contrast / DISTINCTIVENESS_CONTRAST_SCALE)
+    distinctiveness = (kp_score + contrast_score) / 2
+    return distinctiveness, n_kp, contrast
+
+
+def distinctiveness_prior_bias(distinctiveness, frames_since_measure):
+    """Current strength of the init-time distinctiveness prior, decayed by
+    frames elapsed since it was last (re-)measured (see
+    DISTINCTIVENESS_PRIOR_HALF_LIFE). Positive when the target is more
+    distinctive than neutral (0.5) -- add this to appearance signals
+    (vit/orb reliability) and SUBTRACT it from motion/consensus signals
+    (gmc/consensus reliability), so a single continuously-decaying value
+    biases both directions oppositely without ever being a mode switch."""
+    decay = 0.5 ** (frames_since_measure / DISTINCTIVENESS_PRIOR_HALF_LIFE)
+    return (distinctiveness - 0.5) * 2 * DISTINCTIVENESS_PRIOR_STRENGTH * decay
+
+
 def cluster_orb_matches(pts, cluster_dist):
     """Greedily group 2D points into spatial clusters by running centroid
     (single-linkage-ish): a point joins the first existing cluster within
@@ -945,9 +1052,19 @@ def is_valid_for_recovery(bbox, score, frame_area):
     used to declare loss -- see module docstring point 5."""
     if score < RECOVERY_SCORE_THRESHOLD:
         return False
-    x, y, w, h = bbox
-    if w <= 0 or h <= 0:
+    return bbox_geo_sane(bbox, frame_area)
+
+
+def bbox_geo_sane(bbox, frame_area):
+    """Box-size + aspect-ratio sanity only -- the geo half of
+    is_valid_for_recovery(), without its score gate. Used by the Option 2
+    consensus-confirmation path (Stage 5.6): a candidate can be confirmed on
+    strong sustained consensus agreement even on a frame where VitTrack's own
+    score is weak, but it must still be a geometrically sane box, never a
+    degenerate or runaway one."""
+    if bbox is None or bbox[2] <= 0 or bbox[3] <= 0:
         return False
+    w, h = bbox[2], bbox[3]
     if (w * h) > MAX_BBOX_AREA_FRAC * frame_area:
         return False
     return max(w, h) <= MAX_BBOX_ASPECT_RATIO * min(w, h)
@@ -1629,6 +1746,10 @@ def main():
     probation_fusion_streak = 0
     n_probation_fusion_corrections = 0
     probation_consensus_reliability_history = []
+    consensus_confirm_streak = 0
+    n_consensus_confirmations = 0
+    target_distinctiveness = 0.5
+    frames_since_distinctiveness_measure = 0
     consensus_pos = None
     n_votes = 0
     final_pos = None
@@ -1651,6 +1772,14 @@ def main():
         orig_orb = orb.detectAndCompute(orig_tmpl_gray, None) if orig_tmpl_gray is not None else (None, None)
         recent_orb = orig_orb
         print(f"Original ORB template: {len(orig_orb[0]) if orig_orb[0] else 0} keypoints")
+
+        target_distinctiveness, n_kp_init, contrast_init = measure_target_distinctiveness(
+            cleaned1, init_box, orb)
+        frames_since_distinctiveness_measure = 0
+        print(f"Distinctiveness prior | measured={target_distinctiveness:.2f} "
+              f"(keypoints={n_kp_init}, contrast={contrast_init:.1f}) | "
+              f"initial bias: appearance(vit/orb) {DISTINCTIVENESS_PRIOR_STRENGTH * (target_distinctiveness - 0.5) * 2:+.2f}, "
+              f"motion/consensus(gmc/consensus) {-DISTINCTIVENESS_PRIOR_STRENGTH * (target_distinctiveness - 0.5) * 2:+.2f}")
 
         supporters = init_supporters_with_preview(
             cv2.cvtColor(cleaned1, cv2.COLOR_BGR2GRAY), init_box, cleaner.full_mask, cleaned1,
@@ -1738,6 +1867,7 @@ def main():
             print("End of video.")
             break
         frame_idx += 1
+        frames_since_distinctiveness_measure += 1
 
         # Position hint for object-following Telea cleaning (see stage1_overlay
         # docstring) -- best-known position as of the END of the previous
@@ -1785,8 +1915,12 @@ def main():
             # RANSAC inlier ratio with a decay based on how long the CURRENT
             # position estimate has relied on pure, unanchored motion
             # propagation (lost_frames resets at each fresh confirmed anchor).
-            gmc_rel = gmc_reliability(gmc_inlier_ratio, lost_frames)
-            print(f"Frame {frame_idx} | Reliability | gmc={gmc_rel:.2f} "
+            raw_gmc_rel = gmc_reliability(gmc_inlier_ratio, lost_frames)
+            distinctiveness_bias = distinctiveness_prior_bias(
+                target_distinctiveness, frames_since_distinctiveness_measure)
+            gmc_rel = clip01(raw_gmc_rel - distinctiveness_bias)
+            print(f"Frame {frame_idx} | Reliability | gmc={gmc_rel:.2f} (raw={raw_gmc_rel:.2f}, "
+                  f"prior_bias={-distinctiveness_bias:+.2f}) "
                   f"(inlier_ratio={gmc_inlier_ratio:.2f}, matches={gmc_n_matches}, "
                   f"frames_since_anchor={lost_frames})")
             if motion_M is not None:
@@ -1817,6 +1951,14 @@ def main():
                 orig_tmpl_gray = crop_orb_template(cleaned, init_box)
                 orig_orb = orb.detectAndCompute(orig_tmpl_gray, None) if orig_tmpl_gray is not None else (None, None)
                 recent_orb = orig_orb
+
+                target_distinctiveness, n_kp_init, contrast_init = measure_target_distinctiveness(
+                    cleaned, init_box, orb)
+                frames_since_distinctiveness_measure = 0
+                print(f"Frame {frame_idx} | Distinctiveness prior | measured={target_distinctiveness:.2f} "
+                      f"(keypoints={n_kp_init}, contrast={contrast_init:.1f}) | "
+                      f"initial bias: appearance(vit/orb) {DISTINCTIVENESS_PRIOR_STRENGTH * (target_distinctiveness - 0.5) * 2:+.2f}, "
+                      f"motion/consensus(gmc/consensus) {-DISTINCTIVENESS_PRIOR_STRENGTH * (target_distinctiveness - 0.5) * 2:+.2f}")
 
                 # Sequential read (never seek -- see build_static_hud_mask()
                 # comment) stashed in `pending_frame` so the loop's next
@@ -1876,6 +2018,7 @@ def main():
                         probation_count = 0
                     if probation_count >= CONFIRM_FRAMES:
                         probation = False
+                        consensus_confirm_streak = 0
                         last_good_bbox = bbox
                         cx, cy = bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2
                         pos_history = [(cx, cy)]
@@ -1883,6 +2026,11 @@ def main():
                         if refreshed_gray is not None:
                             recent_orb = orb.detectAndCompute(refreshed_gray, None)
                         frames_since_refresh = 0
+                        target_distinctiveness, n_kp_r, contrast_r = measure_target_distinctiveness(
+                            cleaned, bbox, orb)
+                        frames_since_distinctiveness_measure = 0
+                        print(f"Frame {frame_idx} | Distinctiveness prior | re-measured={target_distinctiveness:.2f} "
+                              f"(keypoints={n_kp_r}, contrast={contrast_r:.1f})")
                         print(f"Frame {frame_idx} | TENTATIVE->TRACKING (confirmed) | bbox={bbox} | score={score:.3f}")
                 else:
                     bad_count += 1
@@ -1890,6 +2038,7 @@ def main():
                     if bad_count >= args.lost_n:
                         state = "LOST"
                         probation = False
+                        consensus_confirm_streak = 0
                         n_transitions += 1
                         print(f"Frame {frame_idx} | TENTATIVE->LOST (candidate did not hold) | "
                               f"score={score:.3f} | resuming search from last CONFIRMED position")
@@ -1911,6 +2060,11 @@ def main():
                         if refreshed_gray is not None:
                             recent_orb = orb.detectAndCompute(refreshed_gray, None)
                         frames_since_refresh = 0
+                        target_distinctiveness, n_kp_r, contrast_r = measure_target_distinctiveness(
+                            cleaned, bbox, orb)
+                        frames_since_distinctiveness_measure = 0
+                        print(f"Frame {frame_idx} | Distinctiveness prior | re-measured={target_distinctiveness:.2f} "
+                              f"(keypoints={n_kp_r}, contrast={contrast_r:.1f})")
 
                     # Periodic supporter refresh (see SUPPORTER_REFRESH_*
                     # module comment): re-anchor the spatial fingerprint to
@@ -2038,8 +2192,12 @@ def main():
                     match_count_display = n_matches
 
                     if candidate_bbox is not None:
-                        orb_rel = orb_reliability(n_matches, candidate_spread)
-                        print(f"Frame {frame_idx} | Reliability | orb={orb_rel:.2f} "
+                        raw_orb_rel = orb_reliability(n_matches, candidate_spread)
+                        distinctiveness_bias = distinctiveness_prior_bias(
+                            target_distinctiveness, frames_since_distinctiveness_measure)
+                        orb_rel = clip01(raw_orb_rel + distinctiveness_bias)
+                        print(f"Frame {frame_idx} | Reliability | orb={orb_rel:.2f} (raw={raw_orb_rel:.2f}, "
+                              f"prior_bias={distinctiveness_bias:+.2f}) "
                               f"(matches={n_matches}, spread={candidate_spread:.1f}px)")
 
                         ccx = candidate_bbox[0] + candidate_bbox[2] / 2
@@ -2068,6 +2226,7 @@ def main():
                             state = "TRACKING"
                             probation = True
                             probation_count = 0
+                            consensus_confirm_streak = 0
                             bad_count = 0
                             line_grace_remaining = 0
                             bbox = candidate_bbox
@@ -2096,6 +2255,7 @@ def main():
                         state = "TRACKING"
                         probation = True
                         probation_count = 0
+                        consensus_confirm_streak = 0
                         bad_count = 0
                         line_grace_remaining = 0
                         bbox = fb_bbox
@@ -2119,12 +2279,18 @@ def main():
         # Stage 5.6, Stage 1: per-signal reliability, measured every frame
         # each signal is available. Not fused into anything yet -- purely
         # logged so real behavior on this footage can be inspected first.
+        distinctiveness_bias = distinctiveness_prior_bias(
+            target_distinctiveness, frames_since_distinctiveness_measure)
         if state == "TRACKING" and bbox is not None:
-            vit_rel = vit_reliability(score)
-            print(f"Frame {frame_idx} | Reliability | vit={vit_rel:.2f} (score={score:.3f})")
+            raw_vit_rel = vit_reliability(score)
+            vit_rel = clip01(raw_vit_rel + distinctiveness_bias)
+            print(f"Frame {frame_idx} | Reliability | vit={vit_rel:.2f} (raw={raw_vit_rel:.2f}, "
+                  f"prior_bias={distinctiveness_bias:+.2f}) (score={score:.3f})")
         if consensus_pos is not None:
-            consensus_rel = consensus_reliability(n_votes, consensus_spread)
+            raw_consensus_rel = consensus_reliability(n_votes, consensus_spread)
+            consensus_rel = clip01(raw_consensus_rel - distinctiveness_bias)
             print(f"Frame {frame_idx} | Reliability | consensus={consensus_rel:.2f} "
+                  f"(raw={raw_consensus_rel:.2f}, prior_bias={-distinctiveness_bias:+.2f}) "
                   f"(n_votes={n_votes}, spread={consensus_spread:.1f}px)")
 
         if consensus_pos is not None and tracker_pos is not None:
@@ -2152,6 +2318,7 @@ def main():
         if state == "TRACKING" and not probation and bbox_has_valid_shape(bbox):
             probation_fusion_streak = 0
             probation_consensus_reliability_history.clear()
+            consensus_confirm_streak = 0
             vit_pos = (bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2)
             if consensus_pos is not None:
                 # Smooth consensus reliability over a short rolling window
@@ -2199,6 +2366,7 @@ def main():
             consensus_reliability_history.clear()
             probation_fusion_streak = 0
             probation_consensus_reliability_history.clear()
+            consensus_confirm_streak = 0
             if consensus_pos is not None:
                 final_pos = consensus_pos
                 final_quality = consensus_rel
@@ -2221,7 +2389,9 @@ def main():
             fusion_disagreement_streak = 0
             consensus_reliability_history.clear()
             vit_pos = (bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2)
-            vit_rel_p = vit_reliability(score)
+            raw_vit_rel_p = vit_reliability(score)
+            vit_rel_p = clip01(raw_vit_rel_p + distinctiveness_prior_bias(
+                target_distinctiveness, frames_since_distinctiveness_measure))
             if consensus_pos is not None:
                 probation_consensus_reliability_history.append(consensus_rel)
                 del probation_consensus_reliability_history[:-CONSENSUS_RELIABILITY_SMOOTHING_WINDOW]
@@ -2250,9 +2420,44 @@ def main():
                 final_pos = fused_pos
                 final_quality = smoothed_p if corrected else vit_rel_p
                 dominant_signal = "vit+consensus (fused, tentative)" if corrected else "vit (tentative, unconfirmed)"
+
+                # Stage 5.6, Option 2: strong, SUSTAINED consensus agreement
+                # confirms the candidate on its own, alongside the existing
+                # score-based CONFIRM_FRAMES path -- see the constants'
+                # docstring above. Uses the raw vit_pos/bbox (not fused_pos),
+                # since this judges whether VitTrack and consensus genuinely
+                # agree, not the corrected output.
+                dist_to_consensus = math.hypot(vit_pos[0] - consensus_pos[0], vit_pos[1] - consensus_pos[1])
+                agree = (bbox_geo_sane(bbox, frame_area)
+                          and dist_to_consensus <= CONSENSUS_CONFIRM_MAX_DIST
+                          and smoothed_p >= CONSENSUS_CONFIRM_MIN_RELIABILITY)
+                consensus_confirm_streak = consensus_confirm_streak + 1 if agree else 0
+                print(f"Frame {frame_idx} | Consensus-confirm check | dist={dist_to_consensus:.1f} "
+                      f"(<= {CONSENSUS_CONFIRM_MAX_DIST}) consensus_rel={smoothed_p:.2f} "
+                      f"(>= {CONSENSUS_CONFIRM_MIN_RELIABILITY}) | streak={consensus_confirm_streak}"
+                      f"/{CONSENSUS_CONFIRM_FRAMES}")
+                if consensus_confirm_streak >= CONSENSUS_CONFIRM_FRAMES:
+                    probation = False
+                    probation_count = 0
+                    consensus_confirm_streak = 0
+                    last_good_bbox = bbox
+                    pos_history = [vit_pos]
+                    refreshed_gray = crop_orb_template(cleaned, bbox)
+                    if refreshed_gray is not None:
+                        recent_orb = orb.detectAndCompute(refreshed_gray, None)
+                    frames_since_refresh = 0
+                    target_distinctiveness, n_kp_r, contrast_r = measure_target_distinctiveness(
+                        cleaned, bbox, orb)
+                    frames_since_distinctiveness_measure = 0
+                    print(f"Frame {frame_idx} | Distinctiveness prior | re-measured={target_distinctiveness:.2f} "
+                          f"(keypoints={n_kp_r}, contrast={contrast_r:.1f})")
+                    n_consensus_confirmations += 1
+                    print(f"Frame {frame_idx} | TENTATIVE->TRACKING (confirmed via consensus) | bbox={bbox} | "
+                          f"dist_to_consensus={dist_to_consensus:.1f} consensus_rel={smoothed_p:.2f}")
             else:
                 probation_fusion_streak = 0
                 probation_consensus_reliability_history.clear()
+                consensus_confirm_streak = 0
                 final_pos = vit_pos
                 final_quality = vit_rel_p
                 dominant_signal = "vit (tentative, unconfirmed)"
@@ -2263,6 +2468,7 @@ def main():
             consensus_reliability_history.clear()
             probation_fusion_streak = 0
             probation_consensus_reliability_history.clear()
+            consensus_confirm_streak = 0
             if consensus_pos is not None:
                 final_pos = consensus_pos
                 final_quality = consensus_rel
@@ -2273,6 +2479,7 @@ def main():
             consensus_reliability_history.clear()
             probation_fusion_streak = 0
             probation_consensus_reliability_history.clear()
+            consensus_confirm_streak = 0
             if predicted_pos is not None:
                 final_pos = predicted_pos
                 final_quality = gmc_rel  # None if GMC couldn't be estimated this frame (few flow features)
@@ -2283,6 +2490,7 @@ def main():
             consensus_reliability_history.clear()
             probation_fusion_streak = 0
             probation_consensus_reliability_history.clear()
+            consensus_confirm_streak = 0
             final_pos = held_point
             final_quality = None
             dominant_signal = "held (pre-init)"
@@ -2292,6 +2500,7 @@ def main():
             consensus_reliability_history.clear()
             probation_fusion_streak = 0
             probation_consensus_reliability_history.clear()
+            consensus_confirm_streak = 0
 
         if final_pos is not None:
             q_str = f"{final_quality:.2f}" if final_quality is not None else "N/A"
@@ -2314,7 +2523,8 @@ def main():
           f"{n_ambiguous_resolutions} ambiguous re-detections resolved via supporter consensus, "
           f"{n_suspicious_disagreements} suspicious high-confidence disagreements flagged, "
           f"{n_fusion_corrections} guarded fusion corrections applied, "
-          f"{n_probation_fusion_corrections} guarded TENTATIVE fusion corrections applied")
+          f"{n_probation_fusion_corrections} guarded TENTATIVE fusion corrections applied, "
+          f"{n_consensus_confirmations} TENTATIVE candidates confirmed early via sustained consensus agreement")
     cap.release()
     writer.release()
     cv2.destroyAllWindows()
