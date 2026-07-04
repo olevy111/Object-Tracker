@@ -693,6 +693,26 @@ DISTINCTIVENESS_PRIOR_HALF_LIFE = 15  # frames; how fast the prior's influence d
                                     # for GMC_RELIABILITY_DECAY_HALF_LIFE, for the same reason (a smooth,
                                     # continuous fade, never an abrupt cutover)
 
+# -- Stage 5.6, episode-bootstrap prior: a second, SEPARATE continuous bias,
+# orthogonal to the distinctiveness prior above. Rationale (user observation):
+# right at the START of a tracking episode -- the true video start, or any
+# fresh re-detection -- the supporters/consensus signal is an ESTABLISHED,
+# continuously-tracked, independent-of-the-candidate estimate, while VitTrack
+# has a brand new lock with zero track record yet (and, at the very start,
+# the box placement itself is only as precise as the initial click). The
+# neighbors are also typically easiest to identify early/in a wide view.
+# So consensus is favored FIRST, then fades out smoothly over the same kind
+# of half-life decay as the object's own appearance signals build up their
+# own track record over a few frames -- never a hard switch, and it only
+# ever touches vit/orb/consensus (GMC motion prediction is a different
+# signal, not "the neighbors method", and is left alone here).
+EPISODE_BOOTSTRAP_STRENGTH = 0.30  # max reliability shift (+/-) at the very start of a tracking episode
+                                    # (frames_since_episode_start=0) -- deliberately larger than
+                                    # DISTINCTIVENESS_PRIOR_STRENGTH (0.15): the user asked for consensus
+                                    # to be the MAIN signal at first, not a subtle nudge
+EPISODE_BOOTSTRAP_HALF_LIFE = 15   # frames; matches DISTINCTIVENESS_PRIOR_HALF_LIFE -- by ~3 half-lives
+                                    # (~45 frames) the bias has faded to under 15% of its initial value
+
 
 # Deliberately NOT implemented via cap.set(CAP_PROP_POS_FRAMES) peek-then-
 # rewind -- tried that first and it silently corrupted playback: seeking on
@@ -918,6 +938,16 @@ def distinctiveness_prior_bias(distinctiveness, frames_since_measure):
     biases both directions oppositely without ever being a mode switch."""
     decay = 0.5 ** (frames_since_measure / DISTINCTIVENESS_PRIOR_HALF_LIFE)
     return (distinctiveness - 0.5) * 2 * DISTINCTIVENESS_PRIOR_STRENGTH * decay
+
+
+def episode_bootstrap_bias(frames_since_episode_start):
+    """Current strength of the episode-bootstrap prior, decayed by frames
+    elapsed since this tracking episode began (see
+    EPISODE_BOOTSTRAP_HALF_LIFE). Always >= 0 -- the caller ADDS this to
+    consensus reliability and SUBTRACTS it from vit/orb reliability, so a
+    single continuously-decaying value favors the neighbors first and fades
+    as the object's own appearance signals build their own track record."""
+    return EPISODE_BOOTSTRAP_STRENGTH * (0.5 ** (frames_since_episode_start / EPISODE_BOOTSTRAP_HALF_LIFE))
 
 
 def cluster_orb_matches(pts, cluster_dist):
@@ -1750,6 +1780,7 @@ def main():
     n_consensus_confirmations = 0
     target_distinctiveness = 0.5
     frames_since_distinctiveness_measure = 0
+    frames_since_episode_start = 0
     consensus_pos = None
     n_votes = 0
     final_pos = None
@@ -1784,6 +1815,10 @@ def main():
         supporters = init_supporters_with_preview(
             cv2.cvtColor(cleaned1, cv2.COLOR_BGR2GRAY), init_box, cleaner.full_mask, cleaned1,
             static_mask=static_mask1, skip_pause=args.skip_supporter_preview)
+
+        frames_since_episode_start = 0
+        print(f"Episode bootstrap prior | tracking episode started -- favoring consensus by up to "
+              f"+{EPISODE_BOOTSTRAP_STRENGTH:.2f} for the next ~{EPISODE_BOOTSTRAP_HALF_LIFE * 3} frames")
 
         state = "TRACKING"
         probation = False
@@ -1868,6 +1903,7 @@ def main():
             break
         frame_idx += 1
         frames_since_distinctiveness_measure += 1
+        frames_since_episode_start += 1
 
         # Position hint for object-following Telea cleaning (see stage1_overlay
         # docstring) -- best-known position as of the END of the previous
@@ -1971,6 +2007,11 @@ def main():
                     cv2.cvtColor(cleaned, cv2.COLOR_BGR2GRAY), init_box, cleaner.full_mask, cleaned,
                     static_mask=static_mask_now, skip_pause=args.skip_supporter_preview)
                 frames_since_supporter_refresh = 0
+
+                frames_since_episode_start = 0
+                print(f"Frame {frame_idx} | Episode bootstrap prior | tracking episode started -- favoring "
+                      f"consensus by up to +{EPISODE_BOOTSTRAP_STRENGTH:.2f} for the next "
+                      f"~{EPISODE_BOOTSTRAP_HALF_LIFE * 3} frames")
 
                 state = "TRACKING"
                 probation = False
@@ -2195,9 +2236,10 @@ def main():
                         raw_orb_rel = orb_reliability(n_matches, candidate_spread)
                         distinctiveness_bias = distinctiveness_prior_bias(
                             target_distinctiveness, frames_since_distinctiveness_measure)
-                        orb_rel = clip01(raw_orb_rel + distinctiveness_bias)
+                        episode_bias = episode_bootstrap_bias(frames_since_episode_start)
+                        orb_rel = clip01(raw_orb_rel + distinctiveness_bias - episode_bias)
                         print(f"Frame {frame_idx} | Reliability | orb={orb_rel:.2f} (raw={raw_orb_rel:.2f}, "
-                              f"prior_bias={distinctiveness_bias:+.2f}) "
+                              f"distinctiveness_bias={distinctiveness_bias:+.2f}, episode_bias={-episode_bias:+.2f}) "
                               f"(matches={n_matches}, spread={candidate_spread:.1f}px)")
 
                         ccx = candidate_bbox[0] + candidate_bbox[2] / 2
@@ -2231,6 +2273,10 @@ def main():
                             line_grace_remaining = 0
                             bbox = candidate_bbox
                             n_transitions += 1
+                            frames_since_episode_start = 0
+                            print(f"Frame {frame_idx} | Episode bootstrap prior | tracking episode started -- "
+                                  f"favoring consensus by up to +{EPISODE_BOOTSTRAP_STRENGTH:.2f} for the next "
+                                  f"~{EPISODE_BOOTSTRAP_HALF_LIFE * 3} frames")
                             print(f"Frame {frame_idx} | LOST->TENTATIVE (re-detected, unconfirmed) | matches={n_matches} | "
                                   f"predicted=({pcx:.1f},{pcy:.1f}) | accepted=({ccx:.1f},{ccy:.1f}) | "
                                   f"dist={dist_from_pred:.1f} | radius={radius:.0f}")
@@ -2260,6 +2306,10 @@ def main():
                         line_grace_remaining = 0
                         bbox = fb_bbox
                         n_transitions += 1
+                        frames_since_episode_start = 0
+                        print(f"Frame {frame_idx} | Episode bootstrap prior | tracking episode started -- "
+                              f"favoring consensus by up to +{EPISODE_BOOTSTRAP_STRENGTH:.2f} for the next "
+                              f"~{EPISODE_BOOTSTRAP_HALF_LIFE * 3} frames")
                         print(f"Frame {frame_idx} | LOST->TENTATIVE (motion-only fallback) | "
                               f"predicted=({pcx:.1f},{pcy:.1f}) | bbox={fb_bbox}")
 
@@ -2281,17 +2331,19 @@ def main():
         # logged so real behavior on this footage can be inspected first.
         distinctiveness_bias = distinctiveness_prior_bias(
             target_distinctiveness, frames_since_distinctiveness_measure)
+        episode_bias = episode_bootstrap_bias(frames_since_episode_start)
         if state == "TRACKING" and bbox is not None:
             raw_vit_rel = vit_reliability(score)
-            vit_rel = clip01(raw_vit_rel + distinctiveness_bias)
+            vit_rel = clip01(raw_vit_rel + distinctiveness_bias - episode_bias)
             print(f"Frame {frame_idx} | Reliability | vit={vit_rel:.2f} (raw={raw_vit_rel:.2f}, "
-                  f"prior_bias={distinctiveness_bias:+.2f}) (score={score:.3f})")
+                  f"distinctiveness_bias={distinctiveness_bias:+.2f}, episode_bias={-episode_bias:+.2f}) "
+                  f"(score={score:.3f})")
         if consensus_pos is not None:
             raw_consensus_rel = consensus_reliability(n_votes, consensus_spread)
-            consensus_rel = clip01(raw_consensus_rel - distinctiveness_bias)
+            consensus_rel = clip01(raw_consensus_rel - distinctiveness_bias + episode_bias)
             print(f"Frame {frame_idx} | Reliability | consensus={consensus_rel:.2f} "
-                  f"(raw={raw_consensus_rel:.2f}, prior_bias={-distinctiveness_bias:+.2f}) "
-                  f"(n_votes={n_votes}, spread={consensus_spread:.1f}px)")
+                  f"(raw={raw_consensus_rel:.2f}, distinctiveness_bias={-distinctiveness_bias:+.2f}, "
+                  f"episode_bias={episode_bias:+.2f}) (n_votes={n_votes}, spread={consensus_spread:.1f}px)")
 
         if consensus_pos is not None and tracker_pos is not None:
             dist = math.hypot(consensus_pos[0] - tracker_pos[0], consensus_pos[1] - tracker_pos[1])
@@ -2390,8 +2442,9 @@ def main():
             consensus_reliability_history.clear()
             vit_pos = (bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2)
             raw_vit_rel_p = vit_reliability(score)
-            vit_rel_p = clip01(raw_vit_rel_p + distinctiveness_prior_bias(
-                target_distinctiveness, frames_since_distinctiveness_measure))
+            vit_rel_p = clip01(raw_vit_rel_p
+                                + distinctiveness_prior_bias(target_distinctiveness, frames_since_distinctiveness_measure)
+                                - episode_bootstrap_bias(frames_since_episode_start))
             if consensus_pos is not None:
                 probation_consensus_reliability_history.append(consensus_rel)
                 del probation_consensus_reliability_history[:-CONSENSUS_RELIABILITY_SMOOTHING_WINDOW]
