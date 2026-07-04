@@ -409,6 +409,31 @@ CANDIDATE_MERGE_DISTANCE = 12  # px; a corner-channel and contrast-channel candi
 STATIC_HUD_DIFF_THRESHOLD = 4  # per-pixel absdiff between consecutive frames below this is
                                 # considered "hasn't moved" -- see build_static_hud_mask()
 
+# -- Context-aware tracking, Stage 2: tracking supporters frame-to-frame --
+# Each supporter chosen at init is tracked every frame via optical flow
+# (distinctive corners/blobs are exactly what KLT is good at). A supporter's
+# OWN observed motion is cross-checked against the scene's GLOBAL motion
+# (the existing GMC machinery, stage4_gmc.estimate_motion) -- ground-fixed
+# terrain moves consistently with the camera; something that doesn't (a
+# vehicle, a moving shadow, a shifting cloud) is not a valid rigid anchor
+# and should stop contributing to the spatial fingerprint. A single
+# reliability WEIGHT captures both failure modes (lost tracking and
+# GMC-motion mismatch) uniformly: it decays on a bad frame and recovers on
+# a good one, so one noisy frame (motion blur, a momentary GMC misfit)
+# doesn't instantly kill a supporter, but sustained failure does -- see
+# update_supporters(). Leaving the frame is different: not ambiguous, not
+# recoverable by waiting, so it's an immediate deactivation, no decay.
+SUPPORTER_KLT_WINDOW = 21          # px, optical-flow window size for supporter tracking
+SUPPORTER_KLT_MAX_LEVEL = 3        # pyramid levels for the same
+SUPPORTER_GMC_MAX_DEVIATION = 15   # px; how far a supporter's OBSERVED motion may differ from what
+                                    # the GMC global-scene-motion model predicts for that point before
+                                    # it's treated as evidence the supporter isn't ground-rigid
+SUPPORTER_TRACK_WEIGHT_DECAY = 0.34    # weight lost on a bad frame (lost track or GMC mismatch) --
+                                        # ~3 consecutive bad frames to drop, same rate for both causes
+SUPPORTER_TRACK_WEIGHT_RECOVERY = 0.05  # weight regained per good frame -- recovers slower than it
+                                        # drops, so a supporter that misbehaved once has to re-earn trust
+SUPPORTER_TRACK_MIN_WEIGHT = 0.3   # weight at or below this -- deactivated
+
 
 # Deliberately NOT implemented via cap.set(CAP_PROP_POS_FRAMES) peek-then-
 # rewind -- tried that first and it silently corrupted playback: seeking on
@@ -758,6 +783,8 @@ def select_supporters(gray, target_bbox, overlay_mask, static_mask=None, search_
                 "source": source,
                 "ratio": ratio,
                 "bearing": _bearing_deg(gx - tcx, gy - tcy),
+                "weight": 1.0,      # Stage 2: tracking reliability, see update_supporters()
+                "active": True,     # Stage 2: False once dropped (GMC mismatch, lost, off-frame)
             })
 
     # Corner/contrast candidates landing on the same physical feature --
@@ -800,6 +827,73 @@ def select_supporters(gray, target_bbox, overlay_mask, static_mask=None, search_
     return chosen, n_raw, n_survivors
 
 
+def update_supporters(supporters, prev_gray, curr_gray, motion_M, width, height, frame_idx):
+    """Stage 2: advance each currently-active supporter one frame via
+    optical flow, cross-check its motion against the GMC global-scene-
+    motion estimate, and update its reliability weight accordingly.
+    Mutates `supporters` in place; returns nothing. Logs each individual
+    deactivation with its specific cause.
+
+    Three distinct outcomes per supporter, each frame:
+      - Left the visible frame (VX0..VX1, 0..height) -- immediate, permanent
+        deactivation. Not ambiguous, not something waiting helps with.
+      - Optical flow lost track entirely (status=0) -- no new position
+        exists to use, so it's left at its last known value; weight
+        decays, deactivating once it bottoms out.
+      - Flow succeeded -- position ALWAYS updates to what KLT actually
+        found (trusting a real measurement over a stale one), but weight
+        only recovers if that motion also agrees with the GMC global-
+        scene-motion estimate; a mismatch decays weight instead, without
+        freezing position -- freezing would penalize a perfectly good,
+        ground-rigid supporter for a single noisy GMC estimate by letting
+        its tracked position silently drift away from where the point
+        actually is. Sustained mismatch (a genuinely non-rigid point, e.g.
+        a vehicle) still drops it once weight bottoms out; a one-off
+        noisy frame doesn't."""
+    active = [s for s in supporters if s["active"]]
+    if not active:
+        return
+
+    pts = np.float32([s["pt"] for s in active]).reshape(-1, 1, 2)
+    new_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+        prev_gray, curr_gray, pts, None,
+        winSize=(SUPPORTER_KLT_WINDOW, SUPPORTER_KLT_WINDOW), maxLevel=SUPPORTER_KLT_MAX_LEVEL)
+    status = status.reshape(-1)
+
+    for i, s in enumerate(active):
+        if not status[i]:
+            s["weight"] = max(0.0, s["weight"] - SUPPORTER_TRACK_WEIGHT_DECAY)
+            if s["weight"] <= SUPPORTER_TRACK_MIN_WEIGHT:
+                s["active"] = False
+                print(f"Frame {frame_idx} | Supporter dropped (optical-flow lost track) | "
+                      f"pt=({s['pt'][0]:.1f},{s['pt'][1]:.1f})")
+            continue
+
+        nx, ny = float(new_pts[i, 0, 0]), float(new_pts[i, 0, 1])
+
+        if not (VX0 <= nx <= VX1 and 0 <= ny <= height):
+            s["active"] = False
+            print(f"Frame {frame_idx} | Supporter dropped (left frame bounds) | "
+                  f"pt=({nx:.1f},{ny:.1f})")
+            continue
+
+        rigid = True
+        if motion_M is not None:
+            pred_x, pred_y = transform_point(s["pt"], motion_M)
+            deviation = math.hypot(nx - pred_x, ny - pred_y)
+            rigid = deviation <= SUPPORTER_GMC_MAX_DEVIATION
+
+        s["pt"] = (nx, ny)
+        if rigid:
+            s["weight"] = min(1.0, s["weight"] + SUPPORTER_TRACK_WEIGHT_RECOVERY)
+        else:
+            s["weight"] = max(0.0, s["weight"] - SUPPORTER_TRACK_WEIGHT_DECAY)
+            if s["weight"] <= SUPPORTER_TRACK_MIN_WEIGHT:
+                s["active"] = False
+                print(f"Frame {frame_idx} | Supporter dropped (non-rigid -- GMC motion "
+                      f"mismatch {deviation:.1f}px) | pt=({nx:.1f},{ny:.1f})")
+
+
 def draw_supporter_selection(frame, target_bbox, supporters, color=(255, 200, 0)):
     """Draw the target box, each supporter, and its offset vector back to
     the target center -- a one-time verification snapshot for Stage 1 (is
@@ -814,6 +908,20 @@ def draw_supporter_selection(frame, target_bbox, supporters, color=(255, 200, 0)
         cv2.circle(frame, (sx, sy), 6, color, 2)
         cv2.putText(frame, f"#{i} [{s['source']}] b={s['bearing']:.0f} deg s={s['strength']:.2f}",
                     (sx + 8, sy - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+    return frame
+
+
+def draw_supporters_live(frame, supporters):
+    """Stage 2: small dot per ACTIVE supporter at its current tracked
+    position, brightness = reliability weight -- a continuous, every-frame
+    visual check that stable ones keep being tracked while dropped/
+    unstable ones disappear (see update_supporters())."""
+    for s in supporters:
+        if not s["active"]:
+            continue
+        x, y = int(s["pt"][0]), int(s["pt"][1])
+        intensity = int(80 + 175 * min(1.0, s["weight"]))
+        cv2.circle(frame, (x, y), 5, (0, intensity, 0), 2)
     return frame
 
 
@@ -987,6 +1095,7 @@ def main():
     cleaned = cleaned1
     prev_cleaned = cleaned1
     frame = frame1
+    prev_frame_raw = frame1
 
     bad_count = 0
     frames_since_refresh = 0
@@ -1064,6 +1173,8 @@ def main():
         if show_mask:
             display[cleaner.full_mask > 0] = (0, 0, 255)
 
+        draw_supporters_live(display, supporters)
+
         if state == "TRACKING":
             if probation:
                 draw_probation(display, bbox, score, probation_count)
@@ -1077,7 +1188,9 @@ def main():
 
         stream_label = "CLEANED" if show_cleaned else "ORIGINAL"
         mask_label = " + MASK" if show_mask else ""
-        cv2.putText(display, f"frame {frame_idx}  fps {display_fps:.1f}  [{stream_label}{mask_label}]",
+        n_active_supporters = sum(1 for s in supporters if s["active"])
+        cv2.putText(display, f"frame {frame_idx}  fps {display_fps:.1f}  [{stream_label}{mask_label}]  "
+                              f"supporters {n_active_supporters}/{len(supporters)}",
                     (20, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.imshow(WINDOW_NAME, display)
         writer.write(display)
@@ -1115,6 +1228,20 @@ def main():
 
         prev_cleaned = cleaned
         cleaned = cleaner.clean(frame, hint_center=clean_hint)
+
+        # Stage 2: supporters are tracked every frame regardless of tracking
+        # state (distinct from the "uncertain" block below, which only
+        # needs GMC to propagate a LOST position estimate) -- a fresh GMC
+        # estimate is computed here from consecutive RAW frames (matching
+        # how the module already avoids inpainting artifacts in flow
+        # features, see flow_mask_small) purely for the rigidity cross-check.
+        if supporters:
+            prev_frame_gray = cv2.cvtColor(prev_frame_raw, cv2.COLOR_BGR2GRAY)
+            curr_frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            supporter_motion_M, _ = estimate_motion(prev_frame_gray, curr_frame_gray, flow_mask_small)
+            update_supporters(supporters, prev_frame_gray, curr_frame_gray, supporter_motion_M,
+                               width, height, frame_idx)
+        prev_frame_raw = frame
 
         # Motion prediction keeps propagating on EVERY frame we don't yet fully
         # trust -- both while LOST and while a re-detected candidate is still on
@@ -1376,9 +1503,11 @@ def main():
             fps_frame_count = 0
             fps_window_start = now
 
+    n_active_supporters = sum(1 for s in supporters if s["active"])
     print(f"Summary: {n_transitions} state transitions, {n_lost_frames}/{frame_idx} frames displayed as LOST, "
           f"{n_static_rejections} static-region rejections, {n_distance_rejections} distance-gate rejections, "
-          f"{n_retry_cycles} periodic search-retry cycles after abandonment")
+          f"{n_retry_cycles} periodic search-retry cycles after abandonment, "
+          f"{n_active_supporters}/{len(supporters)} supporters still active at end")
     cap.release()
     writer.release()
     cv2.destroyAllWindows()
