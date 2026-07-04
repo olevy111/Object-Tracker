@@ -651,6 +651,33 @@ WINNER_SWITCH_MARGIN = 0.15       # a challenger must exceed the sticky winner's
 WINNER_SWITCH_PERSISTENCE_FRAMES = 3  # ...and hold that margin for this many CONSECUTIVE frames before
                                     # the display switches -- a single noisy frame's lead isn't enough
 
+# -- Size-scaled toughness (user observation): as the drone descends, an
+# object that's still confirmed and in-frame is BIGGER/closer, which by
+# itself means (a) an ordinary few-pixel position disagreement is
+# proportionally much less significant on a large box than a small one, and
+# (b) a well-established, currently-large confirmed lock deserves more
+# sustained proof before being abandoned for a competing signal. This scales
+# FUSION_AGREEMENT_MAX_DIST and WINNER_SWITCH_PERSISTENCE_FRAMES continuously
+# by the CURRENTLY CONFIRMED object's own measured size -- not by elapsed
+# video time or frame count (module docstring principle 1: no hard-coded
+# phase switch) -- so it naturally strengthens as the real object grows and
+# relaxes back if it doesn't, rather than assuming "later in the video" on
+# its own. WINNER_SWITCH_MARGIN (a reliability-space quantity, not a
+# spatial one) is deliberately left UNSCALED -- there's no physical
+# relationship between object size and how much MORE reliable a challenger
+# needs to be, only between size and pixel/frame-count tolerances.
+SIZE_SCALE_REFERENCE = BOX_SIZE   # the baseline object size (40px) all scaling is relative to -- a
+                                    # confirmed box at this size uses the plain, unscaled thresholds
+SIZE_SCALE_MIN = 1.0              # scale never goes below 1.0 -- a SMALLER-than-reference object
+                                    # shouldn't become MORE trigger-happy to switch than the tuned defaults
+SIZE_SCALE_MAX = 4.0              # cap on how much a large object can inflate the thresholds, so a
+                                    # runaway/degenerate oversized box can't make the guard absurdly (or
+                                    # unrecoverably) sticky
+SIZE_SCALE_EMA_ALPHA = 0.1        # smoothing on the confirmed-size measurement itself (~10-frame time
+                                    # constant) -- the box's own size jitters a bit frame to frame even
+                                    # while genuinely confirmed; smoothing keeps the scale factor (and
+                                    # therefore the effective thresholds) from jittering along with it
+
 # The ONLY permitted cross-signal benefit (principle 3): the appearance
 # template may refresh on strong vit+consensus agreement (GMC isn't active
 # during confirmed tracking, so it's never part of this particular gate).
@@ -823,6 +850,17 @@ def compute_shadow_fusion(signals):
     fy = sum(rel * pos[1] for _, pos, rel in usable) / total_rel
     contributors = [(name, rel / total_rel) for name, _, rel in usable]
     return (fx, fy), contributors
+
+
+def size_toughness_scale(confirmed_size, reference=SIZE_SCALE_REFERENCE,
+                          min_scale=SIZE_SCALE_MIN, max_scale=SIZE_SCALE_MAX):
+    """How much to inflate the fusion guard's spatial/persistence thresholds
+    given the object's current CONFIRMED size (see SIZE_SCALE_* docstring).
+    1.0 at/below the reference size, growing linearly with size above it,
+    capped at max_scale."""
+    if confirmed_size is None or confirmed_size <= 0:
+        return 1.0
+    return max(min_scale, min(max_scale, confirmed_size / reference))
 
 
 def compute_guarded_final_position(signals, sticky_winner, challenger_name, challenger_streak,
@@ -1650,6 +1688,8 @@ def main():
     sticky_winner = None
     challenger_name = None
     challenger_streak = 0
+    confirmed_object_size = float(BOX_SIZE)
+    last_logged_size_scale = 1.0
     final_pos = None
     consensus_pos = None
     n_votes = 0
@@ -2147,6 +2187,21 @@ def main():
             print(f"Frame {frame_idx} | Reliability | vit={vit_rel:.2f} (score={score:.3f})")
         else:
             vit_rel = None
+
+        # Size-scaled toughness (see SIZE_SCALE_* docstring): only a
+        # CONFIRMED, trusted box (not probation, not degenerate) updates the
+        # reference size -- a momentarily wrong or runaway-oversized
+        # tentative box must never inflate how sticky the guard becomes.
+        if state == "TRACKING" and not probation and bbox_valid_shape:
+            current_size = math.sqrt(bbox[2] * bbox[3])
+            confirmed_object_size += SIZE_SCALE_EMA_ALPHA * (current_size - confirmed_object_size)
+        size_scale = size_toughness_scale(confirmed_object_size)
+        if round(size_scale, 2) != round(last_logged_size_scale, 2):
+            print(f"Frame {frame_idx} | Size-scaled toughness | confirmed_size={confirmed_object_size:.1f}px "
+                  f"(ref={SIZE_SCALE_REFERENCE}) -> scale={size_scale:.2f}x -- "
+                  f"agreement_dist={FUSION_AGREEMENT_MAX_DIST * size_scale:.1f}px, "
+                  f"switch_persistence={round(WINNER_SWITCH_PERSISTENCE_FRAMES * size_scale)} frames")
+            last_logged_size_scale = size_scale
         if consensus_pos is not None:
             consensus_rel = consensus_reliability(n_votes, consensus_spread)
             print(f"Frame {frame_idx} | Reliability | consensus={consensus_rel:.2f} "
@@ -2193,7 +2248,9 @@ def main():
             prev_sticky_winner = sticky_winner
             (final_pos, final_mode, final_detail,
              sticky_winner, challenger_name, challenger_streak) = compute_guarded_final_position(
-                signals_this_frame, sticky_winner, challenger_name, challenger_streak)
+                signals_this_frame, sticky_winner, challenger_name, challenger_streak,
+                max_agreement_dist=FUSION_AGREEMENT_MAX_DIST * size_scale,
+                switch_persistence=round(WINNER_SWITCH_PERSISTENCE_FRAMES * size_scale))
             if final_mode == "winner-take-all" and sticky_winner != prev_sticky_winner:
                 n_winner_switches += 1
         if final_pos is not None:
