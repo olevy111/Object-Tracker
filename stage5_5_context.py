@@ -474,6 +474,17 @@ SUPPORTER_VOTE_TOLERANCE = 40      # px; votes further than this from the initia
 SUPPORTER_MIN_ACTIVE_FOR_CONSENSUS = 2  # fewer active supporters than this -- no consensus attempted
                                     # (spec: even 2-3 give a strong fix, but need at least this many
                                     # to call it a "consensus" at all rather than one lone guess)
+SUPPORTER_LINE_EXCLUSION_MARGIN = 8  # px; a supporter currently within this margin of the fixed
+                                    # overlay (crosshair/grid lines) is excluded from THIS FRAME's
+                                    # vote -- temporary, not a drop. update_supporters() tracks
+                                    # supporters on RAW frames (not the cleaned/inpainted ones), so a
+                                    # supporter sitting exactly on a line risks KLT matching the
+                                    # static, screen-locked graphic itself rather than real scene
+                                    # content -- the same class of problem this project has repeatedly
+                                    # hit for the TARGET's own tracking near these lines, just not yet
+                                    # confirmed as a dominant issue for supporters specifically (checked
+                                    # empirically: didn't find obvious corruption in one sample run, but
+                                    # this is cheap insurance regardless).
 
 # Periodic supporter refresh (during confirmed TRACKING only): re-run
 # selection around the CURRENT trusted position instead of relying forever
@@ -496,6 +507,24 @@ SUPPORTER_REFRESH_MIN_ACTIVE = 4   # refresh early if active count drops below t
                                     # fraction of badly-off frames (>=100px) from 32% to 13%, by
                                     # refreshing more proactively rather than waiting for supporters
                                     # to nearly run out)
+
+# High-confidence disagreement flagging: Stage 4's disambiguation only ever
+# runs during a LOST, multi-candidate re-detection -- it never checks a
+# CONFIRMED, ongoing track against the supporter consensus. A high-score
+# lock onto the wrong nearby look-alike (one that never trips into LOST at
+# all) would currently go completely unnoticed, arguably a MORE dangerous
+# failure than a low-score wrong lock, since a low-score one usually self-
+# corrects into LOST/re-detection where disambiguation can at least try to
+# help; a confident wrong lock never gets that chance. This is a
+# monitoring signal only for now -- logged, not acted on. Auto-correcting
+# on it risks the same class of mistake as the REDETECT_LINE_MARGIN
+# regression earlier in this project: acting on an unproven signal can
+# break more than it fixes. Log first, decide whether to act once we've
+# seen how often and how reliably it actually fires.
+SUSPICIOUS_SCORE_THRESHOLD = 0.5    # tracker score at/above this counts as "confident" for this check
+SUSPICIOUS_CONSENSUS_DIST = 60      # px; consensus-vs-tracker disagreement at/above this, while
+                                    # confident, is flagged (matches CANDIDATE_CLUSTER_DISTANCE's
+                                    # sense of "different location", not ordinary vote noise)
 
 
 # Deliberately NOT implemented via cap.set(CAP_PROP_POS_FRAMES) peek-then-
@@ -1077,7 +1106,8 @@ def draw_supporters_live(frame, supporters):
     return frame
 
 
-def compute_supporter_consensus(supporters, tolerance=SUPPORTER_VOTE_TOLERANCE,
+def compute_supporter_consensus(supporters, overlay_mask=None, line_margin=SUPPORTER_LINE_EXCLUSION_MARGIN,
+                                 tolerance=SUPPORTER_VOTE_TOLERANCE,
                                  min_active=SUPPORTER_MIN_ACTIVE_FOR_CONSENSUS):
     """Stage 3: each active supporter votes for the target position (its
     current tracked position minus its fixed init-time offset); the median
@@ -1086,8 +1116,16 @@ def compute_supporter_consensus(supporters, tolerance=SUPPORTER_VOTE_TOLERANCE,
     distortion (small rotation/scale drift since init) as ordinary spread
     rather than letting one badly-distorted supporter skew the result (see
     module docstring). Returns (consensus_pos, n_votes_used) or (None, 0)
-    if fewer than `min_active` supporters are currently active."""
+    if fewer than `min_active` usable supporters are available.
+
+    If `overlay_mask` is given, any active supporter currently within
+    `line_margin` of it is excluded from THIS FRAME's vote (see
+    SUPPORTER_LINE_EXCLUSION_MARGIN) -- temporary, not a drop; it resumes
+    voting the moment it clears the line."""
     active = [s for s in supporters if s["active"]]
+    if overlay_mask is not None:
+        active = [s for s in active
+                   if not bbox_overlaps_mask((s["pt"][0] - 1, s["pt"][1] - 1, 2, 2), overlay_mask, line_margin)]
     if len(active) < min_active:
         return None, 0
 
@@ -1308,6 +1346,7 @@ def main():
     frames_since_abandon = 0
     n_retry_cycles = 0
     n_ambiguous_resolutions = 0
+    n_suspicious_disagreements = 0
     consensus_pos = None
     n_votes = 0
 
@@ -1669,7 +1708,7 @@ def main():
                         # instead, and take the closest. This is strictly a
                         # disambiguator: the single-candidate path above never
                         # touches supporters at all.
-                        consensus_pos, n_votes = compute_supporter_consensus(supporters)
+                        consensus_pos, n_votes = compute_supporter_consensus(supporters, overlay_mask=cleaner.full_mask)
                         if consensus_pos is not None:
                             scored = []
                             for cbbox, ccount in candidates:
@@ -1764,7 +1803,7 @@ def main():
         # are available (see module docstring) -- this is purely a
         # VALIDATION signal right now, not yet consulted by the tracker
         # itself (that's Stage 4).
-        consensus_pos, n_votes = compute_supporter_consensus(supporters)
+        consensus_pos, n_votes = compute_supporter_consensus(supporters, overlay_mask=cleaner.full_mask)
         if state == "TRACKING" and bbox is not None:
             tracker_pos = (bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2)
         elif state == "LOST" and predicted_pos is not None:
@@ -1776,6 +1815,13 @@ def main():
             print(f"Frame {frame_idx} | Consensus check | consensus=({consensus_pos[0]:.1f},"
                   f"{consensus_pos[1]:.1f}) tracker=({tracker_pos[0]:.1f},{tracker_pos[1]:.1f}) "
                   f"dist={dist:.1f} n_votes={n_votes}")
+            if (state == "TRACKING" and not probation and score >= SUSPICIOUS_SCORE_THRESHOLD
+                    and dist >= SUSPICIOUS_CONSENSUS_DIST):
+                n_suspicious_disagreements += 1
+                print(f"Frame {frame_idx} | SUSPICIOUS high-confidence disagreement | "
+                      f"score={score:.3f} (>= {SUSPICIOUS_SCORE_THRESHOLD}) but consensus disagrees by "
+                      f"{dist:.1f}px (>= {SUSPICIOUS_CONSENSUS_DIST}) -- possible confident wrong lock, "
+                      f"not yet acted on (monitoring only)")
 
         fps_frame_count += 1
         now = time.perf_counter()
@@ -1790,7 +1836,8 @@ def main():
           f"{n_static_rejections} static-region rejections, {n_distance_rejections} distance-gate rejections, "
           f"{n_retry_cycles} periodic search-retry cycles after abandonment, "
           f"{n_active_supporters}/{len(supporters)} supporters still active at end, "
-          f"{n_ambiguous_resolutions} ambiguous re-detections resolved via supporter consensus")
+          f"{n_ambiguous_resolutions} ambiguous re-detections resolved via supporter consensus, "
+          f"{n_suspicious_disagreements} suspicious high-confidence disagreements flagged")
     cap.release()
     writer.release()
     cv2.destroyAllWindows()
