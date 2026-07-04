@@ -1,51 +1,4 @@
 """
-Stage 3 -- Loss detection (score-gated + hysteresis) + appearance-verified recovery.
-
-Builds on Stage 2. Declares a TRACKING / LOST state using the confidence
-score (NOT the tracker's own `ok` flag, which Stage 2 showed is unreliable)
-with hysteresis so the state doesn't flicker:
-    - N consecutive bad frames (score below threshold, or a bogus box) ->
-      TRACKING -> LOST
-    - M consecutive GOOD-AND-MATCHING frames while LOST -> LOST -> TRACKING
-
-Why "bogus box" is also checked (not just the score threshold): Stage 2
-testing found that after an extended loss, TrackerVit can lock onto a
-degenerate box covering almost the entire frame while reporting a
-deceptively HIGH score (~0.8). Score-gating alone would never catch this
-(0.8 is above any reasonable threshold), so a box-size sanity bound is
-included as a second, independent gate -- either one failing counts the
-frame as "bad" for the hysteresis counters.
-
-Why appearance verification was added (real bug found while testing this
-stage): score + box-size sanity alone are not enough to trust a recovery.
-TrackerVit keeps running every frame even while displayed as LOST, and on
-this repetitive open-desert footage its fixed template can latch onto a
-different lookalike patch of ground and report a perfectly plausible score
-and box size for the WRONG object. Neither gate catches that, because
-both are about "does this look like a trackable thing", not "is this the
-SAME thing we started with". The fix: before accepting a LOST -> TRACKING
-transition, the candidate box's cleaned-frame content is compared via
-normalized cross-correlation (cv2.matchTemplate) against saved reference
-templates (the original click template, plus the most recent
-high-confidence template so gradual scale/rotation changes aren't
-mistaken for a mismatch). Only if that similarity also clears a threshold
-is the recovery accepted -- otherwise the state stays LOST even though the
-score/size gates alone would have accepted it.
-
-No active search yet (that's Stage 5) -- once LOST, this stage keeps
-feeding frames to the tracker unconditionally and just watches whether it
-self-recovers onto something that also matches the saved appearance; it
-does not actively scan the frame for the object.
-
-State transitions are logged to console. While LOST, the live (untrustworthy)
-box/score are marked "(stale)" and not drawn as if valid; the last known
-good box is shown dimmed instead.
-
-Keys while playing:
-    c  - toggle between showing the ORIGINAL and CLEANED stream
-    m  - toggle mask-visualization overlay (mask drawn in red)
-    q / ESC - quit
-
 Usage:
     python stage3_loss_detection.py --video "../ex/track-train.mp4"
     python stage3_loss_detection.py --video "../ex/track-train.mp4" --x 960 --y 540
@@ -64,47 +17,14 @@ BOX_SIZE = 40
 WINDOW_NAME = "Stage 3 - Loss Detection"
 DEFAULT_MODEL = "models/object_tracking_vittrack_2023sep.onnx"
 
-SCORE_THRESHOLD = 0.30        # below this score, frame counts as "bad"
-LOST_N_FRAMES = 3             # consecutive bad frames -> TRACKING => LOST
-RECOVER_N_FRAMES = 2          # consecutive good+matching frames -> LOST => TRACKING
-MAX_BBOX_AREA_FRAC = 0.03     # sanity cap: box bigger than this fraction of the frame is bogus
+SCORE_THRESHOLD = 0.30
+LOST_N_FRAMES = 3
+RECOVER_N_FRAMES = 2
+MAX_BBOX_AREA_FRAC = 0.03
+MAX_BBOX_ASPECT_RATIO = 2.0
 
-# Why 0.03 and not the Stage-3-v1 0.08: measured on the real clip, legitimate
-# (confirmed correct) boxes topped out around 1.8% of frame area even during
-# real scale growth, while the degenerate false-lock reliably exceeded 7%.
-# 3% sits with margin in the gap between the two -- this is the dominant,
-# reliable gate against the catastrophic full-frame lock.
-
-MAX_BBOX_ASPECT_RATIO = 2.0   # sanity cap: reject a box whose long side is more than this many
-                              # times its short side
-
-# Why: found live on a small, low-contrast object sitting next to a diagonal
-# road/path -- VitTrack's regression drifted to follow the linear road
-# feature instead of staying on the object, growing the box's HEIGHT
-# steadily (40 -> 57 -> 81 -> 98 -> 110px) while width stayed contained
-# (35-52px) -- an elongated strip straddling the road, confirmed visually,
-# not a tight box on the object. This is the same regression-runaway
-# instability as the full-frame catastrophic lock (MAX_BBOX_AREA_FRAC above),
-# just shaped differently (elongated, not large-area) because a nearby
-# linear feature rather than open terrain is what it latched onto. A real
-# small object is expected to be roughly compact, not a long thin strip.
-
-TEMPLATE_MATCH_THRESHOLD = 0.10  # min normalized cross-correlation to accept a recovery
-GOOD_TEMPLATE_SCORE = 0.5        # refresh the "recent" reference template only on strong frames
-
-# Why appearance matching is a LOOSE secondary gate, not the primary defense:
-# measured on the real clip, plain fixed-size-patch normalized cross-correlation
-# does not cleanly separate legitimate (confirmed correct) recoveries from the
-# degenerate false-lock -- both distributions overlap in the 0.0-0.2 range,
-# because this object is tiny, low-texture, and its scale/rotation drifts
-# frame to frame. A strict threshold (e.g. 0.5) rejected genuine recoveries
-# for the rest of the clip. 0.10 mostly stays out of the way of legitimate
-# recoveries while still rejecting clearly anti-correlated (actively
-# dissimilar) content. A robust same-size wrong-object rejection needs a
-# better descriptor than plain NCC -- left for Stage 5's dedicated
-# re-detection design, which can also use the GMC-predicted location (Stage 4)
-# to know WHERE to expect the object instead of trusting wherever the
-# tracker's own passive update drifted to.
+TEMPLATE_MATCH_THRESHOLD = 0.10  # kept low; NCC signal is weak
+GOOD_TEMPLATE_SCORE = 0.5
 
 
 def is_valid(bbox, score, frame_area):
@@ -121,9 +41,6 @@ def is_valid(bbox, score, frame_area):
 
 
 def crop_template(frame, bbox, size):
-    """Crop `bbox` out of `frame`, clipped to frame bounds, and resize to a
-    canonical (size, size) grayscale patch so templates captured from boxes
-    of different sizes remain directly comparable."""
     x, y, w, h = [int(v) for v in bbox]
     x0, y0 = max(0, x), max(0, y)
     x1, y1 = min(frame.shape[1], x + w), min(frame.shape[0], y + h)
@@ -135,9 +52,7 @@ def crop_template(frame, bbox, size):
 
 
 def template_similarity(frame, bbox, templates, size):
-    """Max normalized cross-correlation between the candidate box's content
-    and any of the saved reference templates. Returns -1.0 if the box can't
-    be cropped at all (fully off-frame)."""
+    """Returns -1.0 if bbox can't be cropped (fully off-frame)."""
     candidate = crop_template(frame, bbox, size)
     if candidate is None:
         return -1.0

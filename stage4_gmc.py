@@ -1,48 +1,4 @@
 """
-Stage 4 -- Global Motion Compensation (GMC).
-
-Builds on Stage 3. The drone's camera motion between consecutive frames is
-estimated (sparse optical flow + RANSAC affine), and the CURRENT cleaned
-frame is warped back into the PREVIOUS frame's coordinate system before the
-tracker ever sees it. From the tracker's point of view, the camera is now
-stationary frame-to-frame -- its own last-known position stays valid instead
-of being invalidated every time the drone pans/rolls, which Stage 2/3 showed
-was the dominant cause of tracking loss.
-
-How the motion is estimated and used:
-    1. cv2.goodFeaturesToTrack on the PREVIOUS frame, restricted to the real
-       video content region and EXCLUDING the overlay mask (crosshair + X
-       diagonals) -- required, because those are fixed to the screen, not
-       the scene, and would otherwise vote for "zero motion" and corrupt the
-       estimate.
-    2. cv2.calcOpticalFlowPyrLK tracks those points into the CURRENT frame.
-    3. cv2.estimateAffinePartial2D (RANSAC) fits a similarity transform M
-       (translation + rotation + uniform scale) mapping previous-frame
-       positions to current-frame positions from the matched point pairs.
-    4. The current cleaned frame is warped with WARP_INVERSE_MAP so the
-       result is expressed in the PREVIOUS frame's coordinate system --
-       this is what's fed to tracker.update(), so its internal last-known
-       box position (also in that coordinate system) is still where it
-       expects it to be, motion aside.
-    5. The box the tracker returns (in previous-frame coordinates) is
-       mapped forward through M to get the true current-frame box used for
-       display, the state machine, and appearance verification.
-    Each frame's M is estimated fresh from the true previous/current frames
-    (not accumulated across many frames), so estimation noise doesn't
-    compound into long-term drift.
-    If too few flow matches survive (occlusion, blank sky, RANSAC failure),
-    M is None and this frame silently falls back to Stage 3's un-warped
-    behavior instead of crashing.
-
-Everything else (score-gated loss detection, hysteresis, box-size sanity,
-appearance-verified recovery) is unchanged from Stage 3 and reused directly.
-
-Keys while playing:
-    c  - toggle between showing the ORIGINAL and CLEANED stream
-    m  - toggle mask-visualization overlay (mask drawn in red)
-    g  - toggle an on-screen readout of the estimated motion (dx, dy, matches)
-    q / ESC - quit
-
 Usage:
     python stage4_gmc.py --video "../ex/track-train.mp4"
     python stage4_gmc.py --video "../ex/track-train.mp4" --x 960 --y 540
@@ -69,25 +25,13 @@ DEFAULT_MODEL = "models/object_tracking_vittrack_2023sep.onnx"
 GMC_MAX_CORNERS = 300
 GMC_QUALITY_LEVEL = 0.01
 GMC_MIN_DISTANCE = 10
-GMC_MIN_MATCHES = 10          # below this many good flow matches, distrust the estimate
+GMC_MIN_MATCHES = 10
 GMC_RANSAC_THRESH = 3.0
-GMC_FEATURE_MASK_DILATE = 5   # extra safety margin excluded around the overlay mask
-GMC_DOWNSCALE = 4             # feature detection + flow run at 1/4 resolution (see note below)
-
-# Why downscaled: profiling showed cv2.goodFeaturesToTrack alone costs ~48ms
-# on the full 1920x1080 frame -- on its own already under 30 FPS. Global
-# motion is a low-frequency signal (the whole scene shifting together), so
-# it doesn't need full-resolution corners to estimate accurately. Running
-# feature detection + optical flow at 1/4 resolution (480x270) cuts that to
-# ~3ms combined, a ~13x speedup, before scaling the matched points back up
-# to full-resolution coordinates for the affine fit.
+GMC_FEATURE_MASK_DILATE = 5
+GMC_DOWNSCALE = 4
 
 
 def build_flow_feature_mask(width, height, overlay_mask):
-    """Valid region for optical-flow feature detection: inside the real
-    video content (excludes the black letterbox) and outside the overlay
-    mask (crosshair + X diagonals), which is fixed to the screen and would
-    otherwise look like "zero motion" scene content and bias the estimate."""
     mask = np.zeros((height, width), np.uint8)
     mask[:, VX0:VX1] = 255
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
@@ -98,11 +42,7 @@ def build_flow_feature_mask(width, height, overlay_mask):
 
 
 def estimate_motion(prev_gray, curr_gray, feature_mask_small, scale=GMC_DOWNSCALE):
-    """Returns (M, n_matches). M is a 2x3 affine mapping previous-frame
-    positions to current-frame positions (in full-resolution coordinates),
-    or None if too few reliable matches survive to trust the estimate.
-    Feature detection + optical flow run on downscaled frames for speed;
-    matched points are scaled back up before the affine fit."""
+    """Returns (M, n_matches); M is None if too few matches survive."""
     small_prev = cv2.resize(prev_gray, None, fx=1 / scale, fy=1 / scale, interpolation=cv2.INTER_AREA)
     small_curr = cv2.resize(curr_gray, None, fx=1 / scale, fy=1 / scale, interpolation=cv2.INTER_AREA)
 

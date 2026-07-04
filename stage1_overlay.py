@@ -1,46 +1,4 @@
 """
-Stage 1 -- Overlay removal.
-
-Builds on Stage 0. Removes the drone HUD's fixed crosshair + corner-to-corner
-diagonal "X" lines BEFORE the (future) tracker ever sees a frame.
-
-Two frame streams exist every loop:
-    - `cleaned`  -> the overlay-removed frame (what the tracker will use later)
-    - `original` -> the raw frame (what the user sees by default, so the
-                    crosshair/HUD remain visible in the normal view)
-
-Performance note (why two cleaning methods are used):
-    A single full-frame cv2.inpaint(TELEA) over this mask costs ~33ms/frame
-    (< 30 FPS on its own) because the diagonal lines span corner-to-corner --
-    inpaint's cost scales with the region spanned, not the sparse mask area.
-    Since the plan's own analysis says the tracked object usually sits under
-    the CENTER crosshair (the drone centers its target), we spend the
-    accurate-but-costly Telea inpaint only on a small cropped ROI around the
-    crosshair (~0.6ms, cheap because the crop is small), and use a fast
-    directional gather-scatter fill (sample real pixels from just outside the
-    line, perpendicular to it) for the long diagonal lines elsewhere.
-    Combined cost is ~2.5ms/frame -- ample headroom under the 30 FPS budget.
-
-    Revised after real testing: "the object is rarely exactly on those lines"
-    turned out to only hold near init. Over a long clip with real camera
-    motion, an object that starts well clear of the diagonals can still drift
-    across one later (confirmed live: 3 of 4 tracked objects crossed within
-    ~0.2px of a diagonal at some point in the clip). The fast fill visibly
-    notches/smears a small object's silhouette right where a line crosses it
-    (confirmed visually), which is exactly the wrong moment for the tracker
-    to see a corrupted template. Fix: `OverlayCleaner.clean()` now accepts an
-    optional `hint_center` (the last known/predicted object position) and
-    additionally runs a small full-Telea patch there too -- but ONLY if that
-    patch actually overlaps the mask (checked with a cheap `.any()`), so the
-    extra cost is paid solely on the rare frames where the object is actually
-    near a line, not every frame.
-
-Keys while playing:
-    c  - toggle between showing the ORIGINAL and CLEANED stream
-    m  - toggle mask-visualization overlay (mask drawn in red) on top of
-         whichever stream is currently shown, to verify coverage
-    q / ESC - quit
-
 Usage:
     python stage1_overlay.py --video "../ex/video.mp4"
     python stage1_overlay.py --video "../ex/video.mp4" --x 960 --y 540
@@ -53,25 +11,22 @@ import time
 import cv2
 import numpy as np
 
-# ---- Tunable overlay geometry constants (from analysis of the drone HUD) ----
-VX0, VX1 = 240, 1680          # video content region x-bounds (rest is black letterbox)
-CX, CY = 960, 540             # fixed crosshair center
-CROSSHAIR_ARM = 22            # half-length of each crosshair arm (px)
-LINE_THICKNESS = 3            # thickness of mask lines before dilation
-DILATE_KERNEL_SIZE = 3        # anti-aliasing safety margin around mask lines
-INPAINT_RADIUS = 3            # cv2.inpaint radius
+VX0, VX1 = 240, 1680
+CX, CY = 960, 540
+CROSSHAIR_ARM = 22
+LINE_THICKNESS = 3
+DILATE_KERNEL_SIZE = 3
+INPAINT_RADIUS = 3
 
-CROSSHAIR_ROI_PAD = 40        # extra context (px) around the crosshair arms for the Telea crop
-FAST_FILL_OFFSET = 6          # px to sample outside each diagonal line, perpendicular to it
-OBJECT_HINT_HALF_SIZE = 60    # px half-width of the object-following Telea patch (see clean())
+CROSSHAIR_ROI_PAD = 40
+FAST_FILL_OFFSET = 6
+OBJECT_HINT_HALF_SIZE = 60
 
 BOX_SIZE = 40
 WINDOW_NAME = "Stage 1 - Overlay Removal"
 
 
 def build_overlay_mask(width, height):
-    """Full geometric mask (both diagonals + crosshair), used for
-    visualization and as the reference for what "overlay" means."""
     mask = np.zeros((height, width), np.uint8)
     cv2.line(mask, (VX0, 0), (VX1, height), 255, LINE_THICKNESS)
     cv2.line(mask, (VX1, 0), (VX0, height), 255, LINE_THICKNESS)
@@ -90,9 +45,6 @@ def _dilated_line_mask(height, width, p1, p2):
 
 
 class OverlayCleaner:
-    """Precomputes everything geometry-dependent once, so per-frame cleaning
-    is just cheap array indexing + a small Telea crop."""
-
     def __init__(self, width, height):
         self.width = width
         self.height = height
@@ -103,11 +55,8 @@ class OverlayCleaner:
         y0 = max(0, CY - CROSSHAIR_ARM - CROSSHAIR_ROI_PAD)
         y1 = min(height, CY + CROSSHAIR_ARM + CROSSHAIR_ROI_PAD)
         self.roi = (x0, y0, x1, y1)
-        # Portion of the full mask that falls inside the ROI -- gets high
-        # quality Telea inpainting since this is where the target usually is.
         self.roi_mask = self.full_mask[y0:y1, x0:x1].copy()
 
-        # Diagonal-line mask OUTSIDE the ROI -- gets the fast directional fill.
         diag1 = _dilated_line_mask(height, width, (VX0, 0), (VX1, height))
         diag2 = _dilated_line_mask(height, width, (VX1, 0), (VX0, height))
         far_mask = cv2.bitwise_or(diag1, diag2)
@@ -124,7 +73,7 @@ class OverlayCleaner:
         y1_list, x1_list, y2_list, x2_list = [], [], [], []
         for line_mask, normal in ((diag1, n1), (diag2, n2)):
             m = line_mask.copy()
-            m[y0:y1, x0:x1] = 0  # exclude ROI, handled by Telea instead
+            m[y0:y1, x0:x1] = 0
             ys, xs = np.where(m > 0)
             sy1 = np.clip(np.round(ys + normal[1] * FAST_FILL_OFFSET).astype(np.int32), 0, height - 1)
             sx1 = np.clip(np.round(xs + normal[0] * FAST_FILL_OFFSET).astype(np.int32), 0, width - 1)
@@ -142,28 +91,16 @@ class OverlayCleaner:
         self.far_x2 = np.concatenate(x2_list)
 
     def clean(self, frame, hint_center=None, hint_half_size=OBJECT_HINT_HALF_SIZE):
-        """`hint_center` = (x, y), the last known/predicted object position
-        (from the caller's tracker state) -- if given, and a small patch
-        around it actually overlaps the overlay mask, that patch also gets
-        full-quality Telea inpainting instead of the fast fill. See module
-        docstring: a real object can drift across a diagonal line later in
-        the clip even if it started clear of one, and the fast fill visibly
-        notches a small object's silhouette right at the crossing point."""
         out = frame.copy()
 
-        # Fast directional fill for the diagonal lines away from the crosshair.
         v1 = frame[self.far_y1, self.far_x1].astype(np.int16)
         v2 = frame[self.far_y2, self.far_x2].astype(np.int16)
         out[self.far_ys, self.far_xs] = ((v1 + v2) // 2).astype(np.uint8)
 
-        # High-quality Telea inpaint restricted to the small crosshair ROI.
         x0, y0, x1, y1 = self.roi
         roi_crop = out[y0:y1, x0:x1]
         out[y0:y1, x0:x1] = cv2.inpaint(roi_crop, self.roi_mask, INPAINT_RADIUS, cv2.INPAINT_TELEA)
 
-        # Object-following Telea patch -- cheap no-op on the vast majority of
-        # frames where the hint isn't near any line (the `.any()` check is a
-        # simple slice scan, not an inpaint call).
         if hint_center is not None:
             hx, hy = hint_center
             ox0 = max(0, int(hx - hint_half_size))
@@ -180,11 +117,6 @@ class OverlayCleaner:
 
 
 def bbox_overlaps_mask(bbox, mask, margin=0):
-    """True if `bbox` (padded by `margin` px on each side) overlaps any
-    nonzero pixel of `mask` -- used to detect "the tracked object is
-    currently crossing a known fixed overlay line/crosshair", a
-    predictable, temporary obstruction rather than a generic tracking
-    failure. See stage5_redetection.py's occlusion-grace docstring."""
     x, y, w, h = [int(round(v)) for v in bbox]
     x0 = max(0, x - margin)
     y0 = max(0, y - margin)
@@ -204,16 +136,10 @@ def draw_box(frame, point, box_size=BOX_SIZE, color=(0, 255, 0)):
     return frame
 
 
-SCREEN_FIT_MARGIN = 0.90  # use at most this fraction of the detected screen's width/height, leaving
-                          # room for the window title bar, taskbar, and OS chrome
+SCREEN_FIT_MARGIN = 0.90
 
 
 def get_screen_size():
-    """Detect the current screen's usable resolution so live display windows
-    can be scaled to fit on it (module docstring: the previous fixed native-
-    resolution window was bigger than the actual screen on some machines).
-    Windows-specific (this project's target OS); falls back to a
-    conservative default if detection isn't available (e.g. non-Windows)."""
     try:
         import ctypes
         user32 = ctypes.windll.user32
@@ -224,39 +150,19 @@ def get_screen_size():
 
 
 def compute_display_scale(width, height, margin=SCREEN_FIT_MARGIN):
-    """Scale factor to fit a `width`x`height` frame within `margin` of the
-    detected screen size -- never upscales (capped at 1.0), so a video
-    already smaller than the screen displays at its native size unchanged."""
     screen_w, screen_h = get_screen_size()
     return min(1.0, (screen_w * margin) / width, (screen_h * margin) / height)
 
 
-MAX_TYPED_DIGITS = 4  # pixel coordinates on this project's footage never need more than 4 digits
+MAX_TYPED_DIGITS = 4
 
 
-def pick_point_by_click(frame, display_scale=1.0):
-    """Interactive target selection, two independent ways to specify a point:
-
-    1. Click -- marks a pending point (shown live, re-clickable to change),
-       ENTER confirms it immediately.
-    2. Type -- a staged X -> Y -> mark -> confirm flow: type digits for X,
-       ENTER moves to Y; type digits for Y, ENTER MARKS the square (drawn on
-       screen, not yet confirmed); ENTER again CONFIRMS it. 'r' resets back
-       to typing X from scratch at any point in this flow. Backspace edits
-       the field currently being typed.
-
-    Clicking at any point resets the typed flow back to its start (and vice
-    versa) -- the two methods never mix mid-entry. ESC cancels.
-    `display_scale` (see compute_display_scale) lets the shown window be
-    smaller than the frame's native resolution while still returning
-    coordinates in the ORIGINAL, full-resolution pixel space -- the click
-    position is explicitly divided back by the same scale, never relying on
-    HighGUI's own (backend-dependent, unreliable for precise pixel
-    selection) auto-scaling."""
+def pick_point_by_click(frame, display_scale=1.0, window_name=None):
+    window_name = window_name or WINDOW_NAME
     picked = {"point": None}
     pending_click = {"point": None}
     typed = {"x": "", "y": ""}
-    phase = {"value": "typing_x"}  # "typing_x" -> "typing_y" -> "marked" ; or "click_pending" while a click is live
+    phase = {"value": "typing_x"}
 
     def on_mouse(event, x, y, flags, userdata):
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -269,8 +175,8 @@ def pick_point_by_click(frame, display_scale=1.0):
         cy = max(0, min(int(round(pt[1])), frame.shape[0] - 1))
         return cx, cy
 
-    cv2.namedWindow(WINDOW_NAME)
-    cv2.setMouseCallback(WINDOW_NAME, on_mouse)
+    cv2.namedWindow(window_name)
+    cv2.setMouseCallback(window_name, on_mouse)
 
     print("Click a point (ENTER to confirm), or type X, ENTER, type Y, ENTER to mark, "
           "ENTER again to confirm ('r' to reset, ESC to quit)...")
@@ -288,7 +194,7 @@ def pick_point_by_click(frame, display_scale=1.0):
             status = f"Type X: {typed['x'] or '_'}  -- ENTER to move to Y, r to reset"
         elif phase["value"] == "typing_y":
             status = f"X={typed['x']}  Type Y: {typed['y'] or '_'}  -- ENTER to mark, r to reset"
-        else:  # "marked"
+        else:
             current_point = (int(typed["x"]), int(typed["y"]))
             cx, cy = clamp_point(current_point)
             status = f"Marked: ({cx}, {cy}) -- ENTER to confirm, r to reset"
@@ -301,7 +207,7 @@ def pick_point_by_click(frame, display_scale=1.0):
         shown = (cv2.resize(display, (int(round(display.shape[1] * display_scale)),
                                        int(round(display.shape[0] * display_scale))))
                  if display_scale != 1.0 else display)
-        cv2.imshow(WINDOW_NAME, shown)
+        cv2.imshow(window_name, shown)
         key = cv2.waitKey(20) & 0xFF
 
         if key == 27:  # ESC
@@ -322,7 +228,7 @@ def pick_point_by_click(frame, display_scale=1.0):
                     phase["value"] = "marked"
             elif phase["value"] == "marked":
                 picked["point"] = clamp_point((int(typed["x"]), int(typed["y"])))
-        elif key in (8, 127):  # Backspace -- edits whichever field is currently being typed
+        elif key in (8, 127):  # Backspace
             if phase["value"] == "typing_x":
                 typed["x"] = typed["x"][:-1]
             elif phase["value"] == "typing_y":
