@@ -164,6 +164,20 @@ ORB_TEMPLATE_PADDING = 25     # extra context (px) around the tracking box when 
                               # a bare 40px box yields ~0-5 keypoints, not enough to ever reach ORB_MIN_MATCHES
 TEMPLATE_REFRESH_FRAMES = 30  # refresh the "recent" template every N confident TRACKING frames
 
+# -- Context-aware tracking, Stage 4: multi-candidate re-detection --
+# orb_locate_candidates() (below) can report MORE THAN ONE spatially
+# distinct match -- the genuinely ambiguous case this whole feature exists
+# for (several nearby look-alike objects each independently matching the
+# template). Almost always there's still just one.
+CANDIDATE_CLUSTER_DISTANCE = 60    # px; ORB matches within this distance of each other are treated as
+                                    # the same physical location, not separate candidates
+CANDIDATE_MIN_RATIO = 0.5          # a secondary cluster only counts as a genuinely separate candidate
+                                    # if its match count is at least this fraction of the top cluster's
+                                    # -- a lopsided split (one dominant cluster + a much weaker one) is
+                                    # ordinary match noise from a single real object, not a second
+                                    # real look-alike (measured this exact false-positive earlier in
+                                    # this project's history and had to add this ratio floor to fix it)
+
 # -- Known-obstruction occlusion grace (crossing a fixed overlay line) --
 OCCLUSION_MARGIN = 10
 # Why: traced a real loss precisely -- score forms a clean V-shape bottoming
@@ -527,46 +541,106 @@ def crop_orb_template(frame, bbox, padding=ORB_TEMPLATE_PADDING):
     return cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
 
 
-def orb_locate(orb, bf, search_gray, template_entries, box_size, offset=(0, 0)):
-    """Search `search_gray` for the best match against any of
-    `template_entries` (list of (keypoints, descriptors) from
-    orb.detectAndCompute on reference templates). Returns (bbox, n_matches)
-    in FULL-frame coordinates (using `offset` = the search region's
-    top-left in the full frame), or (None, 0). `box_size` = (w, h) of the
-    tracking box to place at the matched location -- NOT derived from the
+def cluster_orb_matches(pts, cluster_dist):
+    """Greedily group 2D points into spatial clusters by running centroid
+    (single-linkage-ish): a point joins the first existing cluster within
+    `cluster_dist` of that cluster's current centroid, else starts a new
+    one. Cheap and good enough for the small number of matches involved
+    here -- the point isn't precise clustering, it's telling apart "one real
+    location" from "several distinct look-alike locations"."""
+    clusters = []
+    for x, y in pts:
+        placed = False
+        for c in clusters:
+            ccx, ccy = c["centroid"]
+            if math.hypot(x - ccx, y - ccy) <= cluster_dist:
+                c["pts"].append((x, y))
+                n = len(c["pts"])
+                c["centroid"] = (ccx + (x - ccx) / n, ccy + (y - ccy) / n)
+                placed = True
+                break
+        if not placed:
+            clusters.append({"pts": [(x, y)], "centroid": (x, y)})
+    return clusters
+
+
+def orb_locate_candidates(orb, bf, search_gray, template_entries, box_size, offset=(0, 0),
+                           cluster_dist=CANDIDATE_CLUSTER_DISTANCE, min_matches=None,
+                           min_ratio=CANDIDATE_MIN_RATIO):
+    """Search `search_gray` for matches against any of `template_entries`
+    (list of (keypoints, descriptors) from orb.detectAndCompute on
+    reference templates). Returns a list of (bbox, n_matches) in FULL-frame
+    coordinates (using `offset` = the search region's top-left in the full
+    frame), sorted by n_matches descending. `box_size` = (w, h) of the
+    tracking box to place at each matched location -- NOT derived from the
     spread of matched keypoints (tried and found to blow up unboundedly:
     weak/generic matches scatter across a wide area, and feeding that
     inflated size back into the next template crop compounds into a
     runaway growing box, the same failure shape as the Stage 2 degenerate
-    full-frame lock)."""
+    full-frame lock).
+
+    Only the single strongest template's own matches are ever considered:
+    a weaker template's result is discarded outright (`continue` on a lower
+    match count, never even looking at its position) -- tried keeping every
+    template's own qualifying matches and merging across templates by
+    spatial proximity instead, and it created FALSE ambiguity: a weaker
+    template's own unrelated noise started surviving as a spurious "second
+    candidate" whenever it didn't happen to coincide with the stronger
+    template's real match. Cross-template disagreement isn't evidence of
+    two real look-alike objects; it's just one template being weaker
+    (staler, less matched context) than the other.
+
+    Almost always returns exactly one entry -- multiple entries only appear
+    when the winning template's OWN matches split into two-plus spatially
+    distinct clusters that are each a comparable fraction of the total (>=
+    min_ratio of the largest), i.e. that one appearance reference is itself
+    genuinely confused by more than one similarly-strong location (see the
+    SUPPORTER_* logic in main(), which is what this was built for). A
+    lopsided split -- one dominant cluster plus a much smaller one -- is
+    just ordinary match noise around a single real object, not a second
+    look-alike, and collapses back to a single blended-median candidate."""
+    if min_matches is None:
+        min_matches = ORB_MIN_MATCHES
     if search_gray.shape[0] < MIN_ORB_CROP_SIZE or search_gray.shape[1] < MIN_ORB_CROP_SIZE:
-        return None, 0  # ORB's internal pyramid can crash cv2.resize below this size
+        return []  # ORB's internal pyramid can crash cv2.resize below this size
     kp2, des2 = orb.detectAndCompute(search_gray, None)
     if des2 is None or len(des2) < 2:
-        return None, 0
+        return []
 
-    best_bbox = None
-    best_count = 0
-    bw, bh = box_size
+    best_pts = None
+    best_total = 0
     for kp1, des1 in template_entries:
         if des1 is None or len(des1) < 2:
             continue
         matches = bf.knnMatch(des1, des2, k=2)
         good = [m for pair in matches if len(pair) == 2
                 for m, n in [pair] if m.distance < ORB_RATIO_TEST * n.distance]
-        if len(good) < ORB_MIN_MATCHES or len(good) <= best_count:
-            continue
+        if len(good) < min_matches or len(good) <= best_total:
+            continue  # too few matches, or a weaker template than one already seen -- discard
+        best_total = len(good)
+        best_pts = [kp2[m.trainIdx].pt for m in good]
 
-        dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-        # Median, not mean: robust against a handful of scattered outlier
-        # matches pulling the estimated center away from the main cluster.
-        cx = float(np.median(dst_pts[:, 0, 0]))
-        cy = float(np.median(dst_pts[:, 0, 1]))
-        bbox = (float(cx - bw / 2 + offset[0]), float(cy - bh / 2 + offset[1]), float(bw), float(bh))
-        best_bbox = bbox
-        best_count = len(good)
+    if best_pts is None:
+        return []
 
-    return best_bbox, best_count
+    bw, bh = box_size
+
+    def make_bbox(pts):
+        arr = np.array(pts)
+        cx, cy = float(np.median(arr[:, 0])), float(np.median(arr[:, 1]))
+        return (cx - bw / 2 + offset[0], cy - bh / 2 + offset[1], float(bw), float(bh))
+
+    clusters = sorted(
+        (c for c in cluster_orb_matches(best_pts, cluster_dist) if len(c["pts"]) >= min_matches),
+        key=lambda c: -len(c["pts"]))
+
+    if len(clusters) <= 1 or len(clusters[1]["pts"]) < min_ratio * len(clusters[0]["pts"]):
+        return [(make_bbox(best_pts), best_total)]
+
+    threshold = min_ratio * len(clusters[0]["pts"])
+    candidates = [(make_bbox(c["pts"]), len(c["pts"])) for c in clusters if len(c["pts"]) >= threshold]
+    candidates.sort(key=lambda t: -t[1])
+    return candidates
 
 
 def is_static_region(curr_frame, prev_frame, bbox, threshold=STATIC_DIFF_THRESHOLD):
@@ -1233,6 +1307,7 @@ def main():
     search_cycle_frames = 0
     frames_since_abandon = 0
     n_retry_cycles = 0
+    n_ambiguous_resolutions = 0
     consensus_pos = None
     n_votes = 0
 
@@ -1577,11 +1652,50 @@ def main():
                     gray = cv2.cvtColor(cleaned, cv2.COLOR_BGR2GRAY)
                     search_region = gray[ry0:ry1, rx0:rx1]
 
-                    candidate_bbox, n_matches = None, 0
+                    candidates = []
                     if search_region.shape[0] >= MIN_ORB_CROP_SIZE and search_region.shape[1] >= MIN_ORB_CROP_SIZE:
-                        candidate_bbox, n_matches = orb_locate(
+                        candidates = orb_locate_candidates(
                             orb, bf, search_region, [orig_orb, recent_orb],
                             box_size=(args.box_size, args.box_size), offset=(rx0, ry0))
+
+                    candidate_bbox, n_matches = None, 0
+                    if len(candidates) == 1:
+                        candidate_bbox, n_matches = candidates[0]
+                    elif len(candidates) > 1:
+                        # Genuinely ambiguous: several spatially distinct, appearance-
+                        # plausible locations (module docstring: several nearby
+                        # look-alike objects). Appearance can't tell them apart --
+                        # score each by distance to the supporter consensus (Stage 3)
+                        # instead, and take the closest. This is strictly a
+                        # disambiguator: the single-candidate path above never
+                        # touches supporters at all.
+                        consensus_pos, n_votes = compute_supporter_consensus(supporters)
+                        if consensus_pos is not None:
+                            scored = []
+                            for cbbox, ccount in candidates:
+                                cx2 = cbbox[0] + cbbox[2] / 2
+                                cy2 = cbbox[1] + cbbox[3] / 2
+                                cdist = math.hypot(cx2 - consensus_pos[0], cy2 - consensus_pos[1])
+                                scored.append((cdist, cbbox, ccount))
+                            scored.sort(key=lambda t: t[0])
+                            chosen_dist, candidate_bbox, n_matches = scored[0]
+                            others = [(tuple(round(v, 1) for v in b[:2]), c, round(d, 1))
+                                      for d, b, c in scored[1:]]
+                            n_ambiguous_resolutions += 1
+                            print(f"Frame {frame_idx} | LOST (ambiguous: {len(candidates)} candidates, "
+                                  f"consensus n_votes={n_votes}) | picked "
+                                  f"bbox={tuple(round(v, 1) for v in candidate_bbox)} matches={n_matches} "
+                                  f"consensus_dist={chosen_dist:.1f} | others={others}")
+                        else:
+                            # Terrain-adaptive fallback: no usable supporter context
+                            # (too few/no active supporters) -- fall back to plain
+                            # motion-predicted ORB re-detection alone, same as the
+                            # unambiguous path, and say so explicitly.
+                            candidate_bbox, n_matches = candidates[0]
+                            print(f"Frame {frame_idx} | LOST (ambiguous: {len(candidates)} candidates, "
+                                  f"context unavailable -- no active supporters) | falling back to "
+                                  f"best-match bbox={tuple(round(v, 1) for v in candidate_bbox)} "
+                                  f"matches={n_matches}")
                     match_count_display = n_matches
 
                     if candidate_bbox is not None:
@@ -1675,7 +1789,8 @@ def main():
     print(f"Summary: {n_transitions} state transitions, {n_lost_frames}/{frame_idx} frames displayed as LOST, "
           f"{n_static_rejections} static-region rejections, {n_distance_rejections} distance-gate rejections, "
           f"{n_retry_cycles} periodic search-retry cycles after abandonment, "
-          f"{n_active_supporters}/{len(supporters)} supporters still active at end")
+          f"{n_active_supporters}/{len(supporters)} supporters still active at end, "
+          f"{n_ambiguous_resolutions} ambiguous re-detections resolved via supporter consensus")
     cap.release()
     writer.release()
     cv2.destroyAllWindows()
