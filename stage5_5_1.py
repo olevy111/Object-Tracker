@@ -195,7 +195,9 @@ from datetime import datetime
 import cv2
 import numpy as np
 
-from stage1_overlay import OverlayCleaner, pick_point_by_click, bbox_overlaps_mask, VX0, VX1, CX, CY
+from stage1_overlay import (
+    OverlayCleaner, pick_point_by_click, bbox_overlaps_mask, compute_display_scale, VX0, VX1, CX, CY,
+)
 from stage3_loss_detection import (
     is_valid,
     SCORE_THRESHOLD, LOST_N_FRAMES, RECOVER_N_FRAMES, MAX_BBOX_AREA_FRAC, MAX_BBOX_ASPECT_RATIO,
@@ -206,7 +208,7 @@ from stage4_gmc import (
 )
 
 BOX_SIZE = 40
-WINDOW_NAME = "Stage 5.5.1 - Reliability-Weighted Fusion (Stage 1: measure + shadow fusion)"
+WINDOW_NAME = "Stage 5.5.1 - Reliability-Weighted Fusion (Stage 2: guarded acting + unified output)"
 DEFAULT_MODEL = "models/object_tracking_vittrack_2023sep.onnx"
 
 # -- ORB matching (ported from old_object_tracker.py's ReacquiringTracker) --
@@ -1469,6 +1471,17 @@ def main():
     flow_mask_small = cv2.resize(flow_mask, None, fx=1 / GMC_DOWNSCALE, fy=1 / GMC_DOWNSCALE,
                                   interpolation=cv2.INTER_NEAREST)
 
+    # Fit the live display to the actual screen instead of always showing the
+    # video at its native resolution (which can be bigger than the screen --
+    # see module docstring). Purely a DISPLAY concern: all processing/
+    # tracking below still runs at full native resolution; only what's shown
+    # in the window is scaled, and clicks are mapped back to full-res pixels
+    # (see pick_point_by_click).
+    display_scale = compute_display_scale(width, height)
+    if display_scale < 1.0:
+        print(f"Display scaled to {display_scale:.2f}x to fit the screen "
+              f"({width}x{height} -> {int(width * display_scale)}x{int(height * display_scale)})")
+
     ok, frame1 = cap.read()
     if not ok:
         print("ERROR: could not read first frame.")
@@ -1488,7 +1501,7 @@ def main():
         point = (args.x, args.y)
         print(f"Using manual point: {point}")
     else:
-        point = pick_point_by_click(frame1)
+        point = pick_point_by_click(frame1, display_scale=display_scale)
         print(f"Picked point: {point}")
 
     cleaned1 = cleaner.clean(frame1, hint_center=point)
@@ -1620,7 +1633,11 @@ def main():
         mask_label = " + MASK" if show_mask else ""
         cv2.putText(display, f"frame {frame_idx}  fps {display_fps:.1f}  [{stream_label}{mask_label}]",
                     (20, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.imshow(WINDOW_NAME, display)
+        # Screen-fit is a DISPLAY-only concern (see display_scale above) --
+        # the saved output video always keeps the full native resolution.
+        shown = (cv2.resize(display, (int(width * display_scale), int(height * display_scale)))
+                 if display_scale < 1.0 else display)
+        cv2.imshow(WINDOW_NAME, shown)
         writer.write(display)
 
         key = cv2.waitKey(1) & 0xFF

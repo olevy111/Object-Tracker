@@ -204,26 +204,134 @@ def draw_box(frame, point, box_size=BOX_SIZE, color=(0, 255, 0)):
     return frame
 
 
-def pick_point_by_click(frame):
+SCREEN_FIT_MARGIN = 0.90  # use at most this fraction of the detected screen's width/height, leaving
+                          # room for the window title bar, taskbar, and OS chrome
+
+
+def get_screen_size():
+    """Detect the current screen's usable resolution so live display windows
+    can be scaled to fit on it (module docstring: the previous fixed native-
+    resolution window was bigger than the actual screen on some machines).
+    Windows-specific (this project's target OS); falls back to a
+    conservative default if detection isn't available (e.g. non-Windows)."""
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        user32.SetProcessDPIAware()
+        return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+    except Exception:
+        return 1280, 720
+
+
+def compute_display_scale(width, height, margin=SCREEN_FIT_MARGIN):
+    """Scale factor to fit a `width`x`height` frame within `margin` of the
+    detected screen size -- never upscales (capped at 1.0), so a video
+    already smaller than the screen displays at its native size unchanged."""
+    screen_w, screen_h = get_screen_size()
+    return min(1.0, (screen_w * margin) / width, (screen_h * margin) / height)
+
+
+MAX_TYPED_DIGITS = 4  # pixel coordinates on this project's footage never need more than 4 digits
+
+
+def pick_point_by_click(frame, display_scale=1.0):
+    """Interactive target selection, two independent ways to specify a point:
+
+    1. Click -- marks a pending point (shown live, re-clickable to change),
+       ENTER confirms it immediately.
+    2. Type -- a staged X -> Y -> mark -> confirm flow: type digits for X,
+       ENTER moves to Y; type digits for Y, ENTER MARKS the square (drawn on
+       screen, not yet confirmed); ENTER again CONFIRMS it. 'r' resets back
+       to typing X from scratch at any point in this flow. Backspace edits
+       the field currently being typed.
+
+    Clicking at any point resets the typed flow back to its start (and vice
+    versa) -- the two methods never mix mid-entry. ESC cancels.
+    `display_scale` (see compute_display_scale) lets the shown window be
+    smaller than the frame's native resolution while still returning
+    coordinates in the ORIGINAL, full-resolution pixel space -- the click
+    position is explicitly divided back by the same scale, never relying on
+    HighGUI's own (backend-dependent, unreliable for precise pixel
+    selection) auto-scaling."""
     picked = {"point": None}
+    pending_click = {"point": None}
+    typed = {"x": "", "y": ""}
+    phase = {"value": "typing_x"}  # "typing_x" -> "typing_y" -> "marked" ; or "click_pending" while a click is live
 
     def on_mouse(event, x, y, flags, userdata):
         if event == cv2.EVENT_LBUTTONDOWN:
-            picked["point"] = (x, y)
+            pending_click["point"] = (x / display_scale, y / display_scale)
+            typed["x"], typed["y"] = "", ""
+            phase["value"] = "click_pending"
+
+    def clamp_point(pt):
+        cx = max(0, min(int(round(pt[0])), frame.shape[1] - 1))
+        cy = max(0, min(int(round(pt[1])), frame.shape[0] - 1))
+        return cx, cy
 
     cv2.namedWindow(WINDOW_NAME)
     cv2.setMouseCallback(WINDOW_NAME, on_mouse)
 
-    print("Click a point on the video window to select the object to track...")
+    print("Click a point (ENTER to confirm), or type X, ENTER, type Y, ENTER to mark, "
+          "ENTER again to confirm ('r' to reset, ESC to quit)...")
     while picked["point"] is None:
         display = frame.copy()
-        cv2.putText(display, "Click a point to select the target",
-                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
-        cv2.imshow(WINDOW_NAME, display)
+        cv2.putText(display, "Click+ENTER, or type X ENTER Y ENTER(mark) ENTER(confirm) -- r=reset ESC=quit",
+                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+
+        current_point = None
+        if phase["value"] == "click_pending":
+            current_point = pending_click["point"]
+            cx, cy = clamp_point(current_point)
+            status = f"Click pending: ({cx}, {cy}) -- ENTER to confirm, r to reset"
+        elif phase["value"] == "typing_x":
+            status = f"Type X: {typed['x'] or '_'}  -- ENTER to move to Y, r to reset"
+        elif phase["value"] == "typing_y":
+            status = f"X={typed['x']}  Type Y: {typed['y'] or '_'}  -- ENTER to mark, r to reset"
+        else:  # "marked"
+            current_point = (int(typed["x"]), int(typed["y"]))
+            cx, cy = clamp_point(current_point)
+            status = f"Marked: ({cx}, {cy}) -- ENTER to confirm, r to reset"
+        cv2.putText(display, status, (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2)
+
+        if current_point is not None:
+            cv2.drawMarker(display, clamp_point(current_point), (0, 255, 0),
+                            markerType=cv2.MARKER_CROSS, markerSize=18, thickness=2)
+
+        shown = (cv2.resize(display, (int(round(display.shape[1] * display_scale)),
+                                       int(round(display.shape[0] * display_scale))))
+                 if display_scale != 1.0 else display)
+        cv2.imshow(WINDOW_NAME, shown)
         key = cv2.waitKey(20) & 0xFF
-        if key in (27, ord("q")):
+
+        if key == 27:  # ESC
             print("Selection cancelled by user.")
             sys.exit(0)
+        elif key == ord("r"):
+            pending_click["point"] = None
+            typed["x"], typed["y"] = "", ""
+            phase["value"] = "typing_x"
+        elif key in (13, 10):  # ENTER
+            if phase["value"] == "click_pending":
+                picked["point"] = clamp_point(pending_click["point"])
+            elif phase["value"] == "typing_x":
+                if typed["x"]:
+                    phase["value"] = "typing_y"
+            elif phase["value"] == "typing_y":
+                if typed["y"]:
+                    phase["value"] = "marked"
+            elif phase["value"] == "marked":
+                picked["point"] = clamp_point((int(typed["x"]), int(typed["y"])))
+        elif key in (8, 127):  # Backspace -- edits whichever field is currently being typed
+            if phase["value"] == "typing_x":
+                typed["x"] = typed["x"][:-1]
+            elif phase["value"] == "typing_y":
+                typed["y"] = typed["y"][:-1]
+        elif ord("0") <= key <= ord("9"):
+            if phase["value"] == "typing_x" and len(typed["x"]) < MAX_TYPED_DIGITS:
+                typed["x"] += chr(key)
+            elif phase["value"] == "typing_y" and len(typed["y"]) < MAX_TYPED_DIGITS:
+                typed["y"] += chr(key)
 
     return picked["point"]
 
