@@ -148,6 +148,13 @@ TEMPLATE_REFRESH_MIN_RELIABILITY = 0.6
 TEMPLATE_REFRESH_MIN_COOLDOWN = 20
 CONSENSUS_GATED_REFRESH_ENABLED = False  # disabled: destabilized re-detection in testing
 
+VERBOSE = False
+
+
+def vprint(*args, **kwargs):
+    if VERBOSE:
+        print(*args, **kwargs)
+
 
 def build_static_hud_mask(gray1, gray2, threshold=STATIC_HUD_DIFF_THRESHOLD):
     if gray2 is None:
@@ -771,7 +778,7 @@ def draw_final_marker(frame, final_pos, box_wh, color=(0, 255, 0)):
 
 
 def main():
-    global ORB_MIN_MATCHES
+    global ORB_MIN_MATCHES, VERBOSE
     parser = argparse.ArgumentParser(description="Stage 5: ORB-based re-detection with static-region guard")
     parser.add_argument("--video", required=True, help="Path to input video file")
     parser.add_argument("--x", type=int, default=None, help="Manual pixel x on frame 1")
@@ -786,10 +793,15 @@ def main():
     parser.add_argument("--near-crosshair-radius", type=float, default=NEAR_CROSSHAIR_RADIUS)
     parser.add_argument("--no-delayed-init", action="store_true",
                          help="Disable Stage 4.5 delayed init; always initialize immediately (for comparison)")
+    parser.add_argument("--save-video", action="store_true",
+                         help="Also record the tracking display to an output video file")
+    parser.add_argument("--verbose", action="store_true",
+                         help="Print per-frame diagnostic lines (reliability, fusion, consensus)")
     parser.add_argument("--show-cleaned", action="store_true")
     parser.add_argument("--show-mask", action="store_true")
     args = parser.parse_args()
     ORB_MIN_MATCHES = args.min_orb_matches
+    VERBOSE = args.verbose
 
     cap = cv2.VideoCapture(args.video)
     if not cap.isOpened():
@@ -854,8 +866,10 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = os.path.join(output_dir, f"{video_stem}_x{point[0]}_y{point[1]}_{timestamp}.mp4")
     writer_fps = src_fps if src_fps and src_fps > 0 else 30.0
-    writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), writer_fps, (width, height))
-    print(f"Recording output to: {output_path}")
+    writer = None
+    if args.save_video:
+        writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), writer_fps, (width, height))
+        print(f"Recording output to: {output_path}")
 
     frame_idx = 0
     fps_window_start = time.perf_counter()
@@ -865,7 +879,7 @@ def main():
     cleaned = cleaned1
     prev_cleaned = cleaned1
     frame = frame1
-    prev_frame_raw = frame1
+    prev_frame_gray = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
 
     bad_count = 0
     probation_frames = 0
@@ -976,7 +990,8 @@ def main():
         shown = (cv2.resize(display, (int(width * display_scale), int(height * display_scale)))
                  if display_scale < 1.0 else display)
         cv2.imshow(WINDOW_NAME, shown)
-        writer.write(display)
+        if writer is not None:
+            writer.write(display)
 
         key = cv2.waitKey(1) & 0xFF
         if key in (27, ord("q")):
@@ -1007,25 +1022,23 @@ def main():
 
         prev_cleaned = cleaned
         cleaned = cleaner.clean(frame, hint_center=clean_hint)
+        frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         if supporters:
-            prev_frame_gray = cv2.cvtColor(prev_frame_raw, cv2.COLOR_BGR2GRAY)
-            curr_frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            supporter_motion_M, _ = estimate_motion(prev_frame_gray, curr_frame_gray, flow_mask_small)
-            update_supporters(supporters, prev_frame_gray, curr_frame_gray, supporter_motion_M,
+            supporter_motion_M, _ = estimate_motion(prev_frame_gray, frame_gray, flow_mask_small)
+            update_supporters(supporters, prev_frame_gray, frame_gray, supporter_motion_M,
                                width, height, frame_idx)
-        prev_frame_raw = frame
+        prev_frame_gray = frame_gray
 
         gmc_rel = None
         lost_motion_M = None
         uncertain = (state == "LOST") or (state == "TRACKING" and probation)
         if uncertain and lost_prev_gray is not None and predicted_pos is not None:
-            curr_gray_gmc = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             motion_M, gmc_n_matches, gmc_inlier_ratio = estimate_motion_with_inliers(
-                lost_prev_gray, curr_gray_gmc, flow_mask_small)
+                lost_prev_gray, frame_gray, flow_mask_small)
             lost_motion_M = motion_M
             gmc_rel = gmc_reliability(gmc_inlier_ratio, lost_frames)
-            print(f"Frame {frame_idx} | Reliability | gmc={gmc_rel:.2f} "
+            vprint(f"Frame {frame_idx} | Reliability | gmc={gmc_rel:.2f} "
                   f"(inlier_ratio={gmc_inlier_ratio:.2f}, matches={gmc_n_matches}, "
                   f"frames_since_anchor={lost_frames})")
             if motion_M is not None:
@@ -1033,20 +1046,19 @@ def main():
             else:
                 vx, vy = estimate_velocity(pos_history)
                 predicted_pos = (predicted_pos[0] + vx, predicted_pos[1] + vy)
-            lost_prev_gray = curr_gray_gmc
+            lost_prev_gray = frame_gray
 
         if state == "HOLDING":
-            curr_gray_hold = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            estimated = estimate_held_point(gray1_hold, curr_gray_hold, hold_corners0, point)
+            estimated = estimate_held_point(gray1_hold, frame_gray, hold_corners0, point)
             if estimated is not None:
                 held_point = estimated
             else:
-                hold_M, _ = estimate_motion(hold_prev_gray, curr_gray_hold, flow_mask_small)
+                hold_M, _ = estimate_motion(hold_prev_gray, frame_gray, flow_mask_small)
                 if hold_M is not None:
                     held_point = transform_point(held_point, hold_M)
                     print(f"Frame {frame_idx} | HOLDING local flow unavailable -- held point "
                           f"carried by GMC to ({held_point[0]:.1f},{held_point[1]:.1f})")
-            hold_prev_gray = curr_gray_hold
+            hold_prev_gray = frame_gray
             hold_frames += 1
 
             dist_to_crosshair = math.hypot(held_point[0] - CX, held_point[1] - CY)
@@ -1065,7 +1077,7 @@ def main():
 
                 ok2, next_frame = cap.read()
                 peeked_gray = cv2.cvtColor(next_frame, cv2.COLOR_BGR2GRAY) if ok2 else None
-                static_mask_now = build_static_hud_mask(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), peeked_gray)
+                static_mask_now = build_static_hud_mask(frame_gray, peeked_gray)
                 pending_frame = next_frame if ok2 else None
                 supporters = init_supporters(
                     cv2.cvtColor(cleaned, cv2.COLOR_BGR2GRAY), init_box, cleaner.full_mask,
@@ -1165,8 +1177,7 @@ def main():
                                   else f"only {n_active_supp} active")
                         ok_peek, next_frame = cap.read()
                         peeked_gray = cv2.cvtColor(next_frame, cv2.COLOR_BGR2GRAY) if ok_peek else None
-                        static_mask_refresh = build_static_hud_mask(
-                            cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), peeked_gray)
+                        static_mask_refresh = build_static_hud_mask(frame_gray, peeked_gray)
                         pending_frame = next_frame if ok_peek else None
 
                         supporters, n_raw_r, n_survivors_r = select_supporters(
@@ -1186,7 +1197,7 @@ def main():
                     frames_since_motion_fallback = 0
                     lcx, lcy = last_good_bbox[0] + last_good_bbox[2] / 2, last_good_bbox[1] + last_good_bbox[3] / 2
                     predicted_pos = (lcx, lcy)
-                    lost_prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    lost_prev_gray = frame_gray
                     n_transitions += 1
                     print(f"Frame {frame_idx} | TRACKING->LOST | score={score:.3f} | bbox={bbox}")
         else:  # LOST -- motion-gated ORB search, tracker.update() not consulted
@@ -1263,7 +1274,7 @@ def main():
 
                     if candidate_bbox is not None:
                         orb_rel = orb_reliability(n_matches, candidate_spread)
-                        print(f"Frame {frame_idx} | Reliability | orb={orb_rel:.2f} "
+                        vprint(f"Frame {frame_idx} | Reliability | orb={orb_rel:.2f} "
                               f"(matches={n_matches}, spread={candidate_spread:.1f}px)")
 
                         ccx = candidate_bbox[0] + candidate_bbox[2] / 2
@@ -1332,13 +1343,13 @@ def main():
             tracker_pos = None
         if consensus_pos is not None and tracker_pos is not None:
             dist = math.hypot(consensus_pos[0] - tracker_pos[0], consensus_pos[1] - tracker_pos[1])
-            print(f"Frame {frame_idx} | Consensus check | consensus=({consensus_pos[0]:.1f},"
+            vprint(f"Frame {frame_idx} | Consensus check | consensus=({consensus_pos[0]:.1f},"
                   f"{consensus_pos[1]:.1f}) tracker=({tracker_pos[0]:.1f},{tracker_pos[1]:.1f}) "
                   f"dist={dist:.1f} n_votes={n_votes}")
             if (state == "TRACKING" and not probation and score >= SUSPICIOUS_SCORE_THRESHOLD
                     and dist >= SUSPICIOUS_CONSENSUS_DIST):
                 n_suspicious_disagreements += 1
-                print(f"Frame {frame_idx} | SUSPICIOUS high-confidence disagreement | "
+                vprint(f"Frame {frame_idx} | SUSPICIOUS high-confidence disagreement | "
                       f"score={score:.3f} (>= {SUSPICIOUS_SCORE_THRESHOLD}) but consensus disagrees by "
                       f"{dist:.1f}px (>= {SUSPICIOUS_CONSENSUS_DIST}) -- possible confident wrong lock, "
                       f"not yet acted on (monitoring only)")
@@ -1347,7 +1358,7 @@ def main():
         vit_pos = (bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2) if bbox_valid_shape else None
         if state == "TRACKING" and bbox_valid_shape:
             vit_rel = vit_reliability(score)
-            print(f"Frame {frame_idx} | Reliability | vit={vit_rel:.2f} (score={score:.3f})")
+            vprint(f"Frame {frame_idx} | Reliability | vit={vit_rel:.2f} (score={score:.3f})")
         else:
             vit_rel = None
 
@@ -1358,14 +1369,14 @@ def main():
             confirmed_aspect += SIZE_SCALE_EMA_ALPHA * (current_aspect - confirmed_aspect)
         size_scale = size_toughness_scale(confirmed_object_size)
         if round(size_scale, 2) != round(last_logged_size_scale, 2):
-            print(f"Frame {frame_idx} | Size-scaled toughness | confirmed_size={confirmed_object_size:.1f}px "
+            vprint(f"Frame {frame_idx} | Size-scaled toughness | confirmed_size={confirmed_object_size:.1f}px "
                   f"(ref={SIZE_SCALE_REFERENCE}) -> scale={size_scale:.2f}x -- "
                   f"agreement_dist={FUSION_AGREEMENT_MAX_DIST * size_scale:.1f}px, "
                   f"switch_persistence={round(WINNER_SWITCH_PERSISTENCE_FRAMES * size_scale)} frames")
             last_logged_size_scale = size_scale
         if consensus_pos is not None:
             consensus_rel = consensus_reliability(n_votes, consensus_spread)
-            print(f"Frame {frame_idx} | Reliability | consensus={consensus_rel:.2f} "
+            vprint(f"Frame {frame_idx} | Reliability | consensus={consensus_rel:.2f} "
                   f"(n_votes={n_votes}, spread={consensus_spread:.1f}px)")
         else:
             consensus_rel = None
@@ -1381,7 +1392,7 @@ def main():
         shadow_pos, shadow_contributors = compute_shadow_fusion(signals_this_frame)
         if shadow_pos is not None:
             contrib_str = ", ".join(f"{name}={weight:.2f}" for name, weight in shadow_contributors)
-            print(f"Frame {frame_idx} | SHADOW FUSION | pos=({shadow_pos[0]:.1f},{shadow_pos[1]:.1f}) "
+            vprint(f"Frame {frame_idx} | SHADOW FUSION | pos=({shadow_pos[0]:.1f},{shadow_pos[1]:.1f}) "
                   f"contributors=[{contrib_str}]")
             n_shadow_fusion_frames += 1
             if len(shadow_contributors) > 1:
@@ -1402,7 +1413,7 @@ def main():
             if final_mode == "winner-take-all" and sticky_winner != prev_sticky_winner:
                 n_winner_switches += 1
         if final_pos is not None:
-            print(f"Frame {frame_idx} | FINAL | pos=({final_pos[0]:.1f},{final_pos[1]:.1f}) "
+            vprint(f"Frame {frame_idx} | FINAL | pos=({final_pos[0]:.1f},{final_pos[1]:.1f}) "
                   f"mode={final_mode} | {final_detail}")
             if final_mode == "winner-take-all":
                 n_winner_take_all_frames += 1
@@ -1444,9 +1455,10 @@ def main():
           f"({n_winner_switches} actual sticky-winner switches), "
           f"{n_consensus_gated_refreshes} consensus-gated template refreshes")
     cap.release()
-    writer.release()
+    if writer is not None:
+        writer.release()
+        print(f"Saved output video: {output_path}")
     cv2.destroyAllWindows()
-    print(f"Saved output video: {output_path}")
 
 
 if __name__ == "__main__":
