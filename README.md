@@ -7,7 +7,7 @@ CPU (no GPU needed) at 30+ fps on 1920x1080 video.
 
 **Demo video:** [watch here](https://drive.google.com/file/d/1Lnu8d8e9A5EVREzwU8Fwh8y3mXXoDdCR)
 
-**Project summary (Hebrew):** [read here](https://drive.google.com/file/d/16LfBFTQD1ZUGEtBCr_a87GXz_0yIjPn2)
+**Project summary:** [read here](https://drive.google.com/file/d/16XAmiay_IxqWHRcJ0dj1QMTJJE1jKzoR)
 
 ## How to run -- one double-click
 
