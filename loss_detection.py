@@ -1,7 +1,7 @@
 """
 Usage:
-    python stage4_gmc.py --video "../ex/track-train.mp4"
-    python stage4_gmc.py --video "../ex/track-train.mp4" --x 960 --y 540
+    python loss_detection.py --video "../ex/track-train.mp4"
+    python loss_detection.py --video "../ex/track-train.mp4" --x 960 --y 540
 """
 
 import argparse
@@ -11,76 +11,83 @@ import time
 import cv2
 import numpy as np
 
-from stage1_overlay import OverlayCleaner, pick_point_by_click, VX0, VX1
-from stage3_loss_detection import (
-    is_valid, crop_template, template_similarity, draw_tracking, draw_lost,
-    SCORE_THRESHOLD, LOST_N_FRAMES, RECOVER_N_FRAMES, MAX_BBOX_AREA_FRAC,
-    TEMPLATE_MATCH_THRESHOLD, GOOD_TEMPLATE_SCORE,
-)
+from overlay import OverlayCleaner, pick_point_by_click
 
 BOX_SIZE = 40
-WINDOW_NAME = "Stage 4 - Global Motion Compensation"
+WINDOW_NAME = "Stage 3 - Loss Detection"
 DEFAULT_MODEL = "models/object_tracking_vittrack_2023sep.onnx"
 
-GMC_MAX_CORNERS = 300
-GMC_QUALITY_LEVEL = 0.01
-GMC_MIN_DISTANCE = 10
-GMC_MIN_MATCHES = 10
-GMC_RANSAC_THRESH = 3.0
-GMC_FEATURE_MASK_DILATE = 5
-GMC_DOWNSCALE = 4
+SCORE_THRESHOLD = 0.30
+LOST_N_FRAMES = 3
+RECOVER_N_FRAMES = 2
+MAX_BBOX_AREA_FRAC = 0.03
+MAX_BBOX_ASPECT_RATIO = 2.0
+
+TEMPLATE_MATCH_THRESHOLD = 0.10  # kept low; NCC signal is weak
+GOOD_TEMPLATE_SCORE = 0.5
 
 
-def build_flow_feature_mask(width, height, overlay_mask):
-    mask = np.zeros((height, width), np.uint8)
-    mask[:, VX0:VX1] = 255
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                        (GMC_FEATURE_MASK_DILATE, GMC_FEATURE_MASK_DILATE))
-    excluded = cv2.dilate(overlay_mask, kernel, iterations=1)
-    mask[excluded > 0] = 0
-    return mask
-
-
-def estimate_motion(prev_gray, curr_gray, feature_mask_small, scale=GMC_DOWNSCALE):
-    """Returns (M, n_matches); M is None if too few matches survive."""
-    small_prev = cv2.resize(prev_gray, None, fx=1 / scale, fy=1 / scale, interpolation=cv2.INTER_AREA)
-    small_curr = cv2.resize(curr_gray, None, fx=1 / scale, fy=1 / scale, interpolation=cv2.INTER_AREA)
-
-    pts_prev = cv2.goodFeaturesToTrack(small_prev, maxCorners=GMC_MAX_CORNERS,
-                                        qualityLevel=GMC_QUALITY_LEVEL,
-                                        minDistance=max(1, GMC_MIN_DISTANCE // scale),
-                                        mask=feature_mask_small)
-    if pts_prev is None or len(pts_prev) < GMC_MIN_MATCHES:
-        return None, 0 if pts_prev is None else len(pts_prev)
-
-    pts_curr, status, _ = cv2.calcOpticalFlowPyrLK(small_prev, small_curr, pts_prev, None)
-    status = status.reshape(-1).astype(bool)
-    good_prev = pts_prev[status] * scale
-    good_curr = pts_curr[status] * scale
-    if len(good_prev) < GMC_MIN_MATCHES:
-        return None, len(good_prev)
-
-    M, _ = cv2.estimateAffinePartial2D(good_prev, good_curr, method=cv2.RANSAC,
-                                        ransacReprojThreshold=GMC_RANSAC_THRESH)
-    return M, len(good_prev)
-
-
-def warp_to_prev(frame, M, size):
-    return cv2.warpAffine(frame, M, size, flags=cv2.WARP_INVERSE_MAP | cv2.INTER_LINEAR,
-                           borderMode=cv2.BORDER_REPLICATE)
-
-
-def transform_bbox(bbox, M):
+def is_valid(bbox, score, frame_area, max_area=None, max_aspect=None):
+    if score < SCORE_THRESHOLD:
+        return False
     x, y, w, h = bbox
-    corners = np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]], dtype=np.float32).reshape(-1, 1, 2)
-    warped = cv2.transform(corners, M).reshape(-1, 2)
-    x0, y0 = warped.min(axis=0)
-    x1, y1 = warped.max(axis=0)
-    return (float(x0), float(y0), float(x1 - x0), float(y1 - y0))
+    if w <= 0 or h <= 0:
+        return False
+    if max_area is None:
+        max_area = MAX_BBOX_AREA_FRAC * frame_area
+    if max_aspect is None:
+        max_aspect = MAX_BBOX_ASPECT_RATIO
+    if (w * h) > max_area:
+        return False
+    if max(w, h) > max_aspect * min(w, h):
+        return False
+    return True
+
+
+def crop_template(frame, bbox, size):
+    x, y, w, h = [int(v) for v in bbox]
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(frame.shape[1], x + w), min(frame.shape[0], y + h)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    crop = frame[y0:y1, x0:x1]
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    return cv2.resize(gray, (size, size))
+
+
+def template_similarity(frame, bbox, templates, size):
+    """Returns -1.0 if bbox can't be cropped (fully off-frame)."""
+    candidate = crop_template(frame, bbox, size)
+    if candidate is None:
+        return -1.0
+    best = -1.0
+    for tmpl in templates:
+        if tmpl is None:
+            continue
+        result = cv2.matchTemplate(candidate, tmpl, cv2.TM_CCOEFF_NORMED)
+        best = max(best, float(result[0, 0]))
+    return best
+
+
+def draw_tracking(frame, bbox, score, color=(0, 255, 0)):
+    x, y, w, h = [int(v) for v in bbox]
+    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+    cv2.putText(frame, f"TRACKING score={score:.2f}", (x, max(0, y - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    return frame
+
+
+def draw_lost(frame, last_good_bbox, score, color=(0, 0, 255), dim_color=(120, 120, 120)):
+    if last_good_bbox is not None:
+        x, y, w, h = [int(v) for v in last_good_bbox]
+        cv2.rectangle(frame, (x, y), (x + w, y + h), dim_color, 1)
+    cv2.putText(frame, f"LOST  score(stale)={score:.2f}", (20, 80),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+    return frame
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stage 4: GMC-compensated tracking with Stage 3 loss detection")
+    parser = argparse.ArgumentParser(description="Stage 3: score-gated loss detection + appearance-verified recovery")
     parser.add_argument("--video", required=True, help="Path to input video file")
     parser.add_argument("--x", type=int, default=None, help="Manual pixel x on frame 1")
     parser.add_argument("--y", type=int, default=None, help="Manual pixel y on frame 1")
@@ -91,10 +98,8 @@ def main():
     parser.add_argument("--recover-n", type=int, default=RECOVER_N_FRAMES)
     parser.add_argument("--max-bbox-area-frac", type=float, default=MAX_BBOX_AREA_FRAC)
     parser.add_argument("--template-match-threshold", type=float, default=TEMPLATE_MATCH_THRESHOLD)
-    parser.add_argument("--no-gmc", action="store_true", help="Disable GMC (falls back to Stage 3 behavior, for comparison)")
     parser.add_argument("--show-cleaned", action="store_true")
     parser.add_argument("--show-mask", action="store_true")
-    parser.add_argument("--show-motion", action="store_true")
     args = parser.parse_args()
 
     cap = cv2.VideoCapture(args.video)
@@ -110,9 +115,6 @@ def main():
     print(f"Resolution: {width}x{height}, source FPS: {src_fps:.2f}")
 
     cleaner = OverlayCleaner(width, height)
-    flow_mask = build_flow_feature_mask(width, height, cleaner.full_mask)
-    flow_mask_small = cv2.resize(flow_mask, None, fx=1 / GMC_DOWNSCALE, fy=1 / GMC_DOWNSCALE,
-                                  interpolation=cv2.INTER_NEAREST)
 
     ok, frame1 = cap.read()
     if not ok:
@@ -141,13 +143,10 @@ def main():
     orig_template = crop_template(cleaned1, init_box, template_size)
     recent_template = orig_template
 
-    prev_gray = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
-
     cv2.namedWindow(WINDOW_NAME)
 
     show_cleaned = args.show_cleaned
     show_mask = args.show_mask
-    show_motion = args.show_motion
 
     frame_idx = 0
     fps_window_start = time.perf_counter()
@@ -163,9 +162,6 @@ def main():
     last_good_bbox = init_box
     score = 1.0
     bbox = init_box
-    motion_info = "no motion yet"
-    n_lost_frames = 0
-    n_transitions = 0
 
     while True:
         base = cleaned if show_cleaned else frame
@@ -178,15 +174,11 @@ def main():
             draw_tracking(display, bbox, score)
         else:
             draw_lost(display, last_good_bbox, score)
-            n_lost_frames += 1
 
         stream_label = "CLEANED" if show_cleaned else "ORIGINAL"
         mask_label = " + MASK" if show_mask else ""
         cv2.putText(display, f"frame {frame_idx}  fps {display_fps:.1f}  [{stream_label}{mask_label}]",
                     (20, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        if show_motion:
-            cv2.putText(display, motion_info, (20, height - 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
         cv2.imshow(WINDOW_NAME, display)
 
         key = cv2.waitKey(1) & 0xFF
@@ -196,8 +188,6 @@ def main():
             show_cleaned = not show_cleaned
         elif key == ord("m"):
             show_mask = not show_mask
-        elif key == ord("g"):
-            show_motion = not show_motion
 
         ok, frame = cap.read()
         if not ok:
@@ -206,21 +196,8 @@ def main():
         frame_idx += 1
 
         cleaned = cleaner.clean(frame)
-        curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        M, n_matches = (None, 0) if args.no_gmc else estimate_motion(prev_gray, curr_gray, flow_mask_small)
-        if M is not None:
-            search_frame = warp_to_prev(cleaned, M, (width, height))
-            dx, dy = M[0, 2], M[1, 2]
-            motion_info = f"GMC dx={dx:+.1f} dy={dy:+.1f} matches={n_matches}"
-        else:
-            search_frame = cleaned
-            motion_info = f"GMC unavailable (matches={n_matches})"
-        prev_gray = curr_gray
-
-        _, bbox_search = tracker.update(search_frame)
+        _, bbox = tracker.update(cleaned)
         score = tracker.getTrackingScore()
-        bbox = transform_bbox(bbox_search, M) if M is not None else bbox_search
         valid = is_valid(bbox, score, frame_area)
 
         if state == "TRACKING":
@@ -236,7 +213,6 @@ def main():
                 if bad_count >= args.lost_n:
                     state = "LOST"
                     good_count = 0
-                    n_transitions += 1
                     print(f"Frame {frame_idx} | TRACKING->LOST | score={score:.3f} | bbox={bbox}")
         else:  # LOST
             if valid:
@@ -250,10 +226,10 @@ def main():
                         refreshed = crop_template(cleaned, bbox, template_size)
                         if refreshed is not None:
                             recent_template = refreshed
-                        n_transitions += 1
                         print(f"Frame {frame_idx} | LOST->TRACKING | score={score:.3f} | sim={sim:.3f} | bbox={bbox}")
                 else:
                     good_count = 0
+                    print(f"Frame {frame_idx} | LOST (appearance reject) | score={score:.3f} | sim={sim:.3f} | bbox={bbox}")
             else:
                 good_count = 0
 
@@ -265,7 +241,6 @@ def main():
             fps_frame_count = 0
             fps_window_start = now
 
-    print(f"Summary: {n_transitions} state transitions, {n_lost_frames}/{frame_idx} frames displayed as LOST")
     cap.release()
     cv2.destroyAllWindows()
 

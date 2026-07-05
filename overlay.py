@@ -1,7 +1,7 @@
 """
 Usage:
-    python stage1_overlay.py --video "../ex/video.mp4"
-    python stage1_overlay.py --video "../ex/video.mp4" --x 960 --y 540
+    python overlay.py --video "../ex/video.mp4"
+    python overlay.py --video "../ex/video.mp4" --x 960 --y 540
 """
 
 import argparse

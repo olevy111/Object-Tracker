@@ -5,8 +5,8 @@ Keys while playing:
     q / ESC - quit
 
 Usage:
-    python stage5_5_1.py --video "../ex/track-train.mp4"
-    python stage5_5_1.py --video "../ex/track-train.mp4" --x 960 --y 540
+    python tracker.py --video "../ex/track-train.mp4"
+    python tracker.py --video "../ex/track-train.mp4" --x 960 --y 540
 """
 
 import argparse
@@ -19,20 +19,20 @@ from datetime import datetime
 import cv2
 import numpy as np
 
-from stage1_overlay import (
+from overlay import (
     OverlayCleaner, pick_point_by_click, bbox_overlaps_mask, compute_display_scale, VX0, VX1, CX, CY,
 )
-from stage3_loss_detection import (
+from loss_detection import (
     is_valid,
     SCORE_THRESHOLD, LOST_N_FRAMES, RECOVER_N_FRAMES, MAX_BBOX_AREA_FRAC, MAX_BBOX_ASPECT_RATIO,
 )
-from stage4_gmc import (
+from gmc import (
     build_flow_feature_mask, estimate_motion, GMC_DOWNSCALE,
     GMC_MAX_CORNERS, GMC_QUALITY_LEVEL, GMC_MIN_DISTANCE, GMC_MIN_MATCHES, GMC_RANSAC_THRESH,
 )
 
 BOX_SIZE = 40
-WINDOW_NAME = "Stage 5.5.1 - Reliability-Weighted Fusion (Stage 2: guarded acting + unified output)"
+WINDOW_NAME = "Pixel Tracker"
 DEFAULT_MODEL = "models/object_tracking_vittrack_2023sep.onnx"
 
 INIT_REFINE_SEARCH_RADIUS = 8   # px; how far to search around the click for a better anchor center
@@ -178,6 +178,13 @@ def crop_orb_template(frame, bbox, padding=ORB_TEMPLATE_PADDING):
         return None
     crop = frame[y0:y1, x0:x1]
     return cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+
+def clamp_point_for_box(point, width, height, half):
+    """Keep the point far enough from the frame edges for its box to fit."""
+    x = min(max(int(round(point[0])), half), width - 1 - half)
+    y = min(max(int(round(point[1])), half), height - 1 - half)
+    return x, y
 
 
 def refine_init_center(frame, point, orb_detector, box_size,
@@ -843,6 +850,11 @@ def main():
         point = pick_point_by_click(frame1, display_scale=display_scale, window_name=WINDOW_NAME)
         print(f"Picked point: {point}")
 
+    clamped = clamp_point_for_box(point, width, height, args.box_size // 2)
+    if clamped != tuple(point):
+        print(f"Point {point} adjusted to {clamped} so the tracking box fits inside the frame.")
+    point = clamped
+
     cleaned1 = cleaner.clean(frame1, hint_center=point)
 
     half = args.box_size // 2
@@ -854,7 +866,7 @@ def main():
     refined_point, refined_kp = refine_init_center(cleaned1, point, orb, args.box_size)
     if refined_point != point:
         print(f"Refined init point: {point} -> {refined_point} ({refined_kp} keypoints)")
-    point = refined_point
+    point = clamp_point_for_box(refined_point, width, height, half)
 
     cv2.namedWindow(WINDOW_NAME)
     show_cleaned = args.show_cleaned
@@ -983,10 +995,6 @@ def main():
         if state not in ("TRACKING", "HOLDING"):
             n_lost_frames += 1
 
-        stream_label = "CLEANED" if show_cleaned else "ORIGINAL"
-        mask_label = " + MASK" if show_mask else ""
-        cv2.putText(display, f"frame {frame_idx}  fps {display_fps:.1f}  [{stream_label}{mask_label}]",
-                    (20, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         shown = (cv2.resize(display, (int(width * display_scale), int(height * display_scale)))
                  if display_scale < 1.0 else display)
         cv2.imshow(WINDOW_NAME, shown)
@@ -1067,6 +1075,7 @@ def main():
                 hy = min(max(held_point[1], half), height - half)
                 (hx, hy), refined_kp = refine_init_center(cleaned, (int(round(hx)), int(round(hy))),
                                                            orb, args.box_size)
+                hx, hy = clamp_point_for_box((hx, hy), width, height, half)
                 init_box = (int(round(hx - half)), int(round(hy - half)), args.box_size, args.box_size)
 
                 tracker = cv2.TrackerVit_create(params)
