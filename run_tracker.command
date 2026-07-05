@@ -12,4 +12,4 @@ if ! venv/bin/python -c "import cv2, numpy" >/dev/null 2>&1; then
     venv/bin/python -m pip install -r requirements.txt
 fi
 
-venv/bin/python app.py
+venv/bin/python src/app.py

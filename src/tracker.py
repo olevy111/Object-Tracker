@@ -33,7 +33,8 @@ from gmc import (
 
 BOX_SIZE = 40
 WINDOW_NAME = "Pixel Tracker"
-DEFAULT_MODEL = "models/object_tracking_vittrack_2023sep.onnx"
+DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                             "models", "object_tracking_vittrack_2023sep.onnx")
 
 INIT_REFINE_SEARCH_RADIUS = 8   # px; how far to search around the click for a better anchor center
 INIT_REFINE_STEP = 2            # px; grid step size for that search

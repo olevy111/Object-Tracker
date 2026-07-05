@@ -77,6 +77,38 @@ def prompt_for_video(previous):
     entry.focus_set()
     entry.icursor(tk.END)
 
+    def paste_into_entry():
+        try:
+            text = root.clipboard_get()
+        except tk.TclError:
+            return
+        if entry.selection_present():
+            entry.delete(tk.SEL_FIRST, tk.SEL_LAST)
+        entry.insert(tk.INSERT, text)
+
+    def on_ctrl_key(event):
+        # Layout-independent Ctrl shortcuts: with a Hebrew keyboard the keysym is a
+        # Hebrew letter, so tkinter's built-in Ctrl+V/C/A bindings never fire.
+        if not event.state & 0x4:
+            return None
+        if event.keycode == 86:  # V
+            paste_into_entry()
+            return "break"
+        if event.keycode == 65:  # A
+            entry.select_range(0, tk.END)
+            entry.icursor(tk.END)
+            return "break"
+        if event.keycode == 67 and entry.selection_present():  # C
+            root.clipboard_clear()
+            root.clipboard_append(entry.selection_get())
+            return "break"
+        return None
+
+    entry.bind("<KeyPress>", on_ctrl_key)
+    context_menu = tk.Menu(root, tearoff=0)
+    context_menu.add_command(label="Paste", command=paste_into_entry)
+    entry.bind("<Button-3>", lambda e: context_menu.tk_popup(e.x_root, e.y_root))
+
     def browse():
         chosen = filedialog.askopenfilename(
             title="Choose a video file",
