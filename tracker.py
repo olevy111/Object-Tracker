@@ -49,6 +49,11 @@ TEMPLATE_REFRESH_FRAMES = 30
 
 CANDIDATE_CLUSTER_DISTANCE = 60
 CANDIDATE_MIN_RATIO = 0.5
+PEAK_AMBIGUITY_RATIO = 0.8  # refuse blind re-acquisition when 2nd candidate is this close to the best
+
+TEMPLATE_BANK_MAX = 4
+TEMPLATE_BANK_MIN_ZOOM_GAP = 1.3  # admit a snapshot only at a meaningfully new zoom level
+TEMPLATE_BANK_MIN_SCORE = 0.5
 
 OCCLUSION_MARGIN = 10
 LINE_GRACE_COOLDOWN = 10
@@ -129,6 +134,11 @@ GMC_RELIABILITY_DECAY_HALF_LIFE = 60
 FUSION_AGREEMENT_MAX_DIST = 40
 MIN_SIGNAL_RELIABILITY = 0.05
 
+ZOOM_STEP_MIN, ZOOM_STEP_MAX = 0.8, 1.25    # per-frame zoom outlier clamp
+ZOOM_RATIO_MIN, ZOOM_RATIO_MAX = 0.2, 8.0   # template rescale bounds
+ZOOM_RESCALE_MIN_CHANGE = 0.2               # rescale a template once zoom drifts past this
+EXPECTED_SIZE_RATIO_MIN, EXPECTED_SIZE_RATIO_MAX = 0.5, 8.0
+
 WINNER_SWITCH_MARGIN = 0.15
 WINNER_SWITCH_PERSISTENCE_FRAMES = 3
 STICKY_DECLINE_STREAK_THRESHOLD = 2  # consecutive frames of the sticky winner's OWN reliability
@@ -185,6 +195,55 @@ def clamp_point_for_box(point, width, height, half):
     x = min(max(int(round(point[0])), half), width - 1 - half)
     y = min(max(int(round(point[1])), half), height - 1 - half)
     return x, y
+
+
+def affine_scale(M):
+    lin = np.array(M[:, :2], dtype=np.float64)
+    return float(np.sqrt(abs(np.linalg.det(lin))))
+
+
+def make_template(gray, zoom, orb_detector):
+    if gray is None:
+        return None
+    kp, des = orb_detector.detectAndCompute(gray, None)
+    return {"gray": gray, "zoom": zoom, "des": des, "n_kp": 0 if kp is None else len(kp),
+            "cache_ratio": 1.0, "cache_des": des}
+
+
+def template_descriptors(entry, cum_zoom, orb_detector):
+    """Descriptors for matching at the CURRENT scene scale: when the camera zoom
+    has drifted from the template's capture zoom, match against a rescaled copy
+    of the stored template instead of the original."""
+    if entry is None:
+        return None
+    ratio = min(max(cum_zoom / entry["zoom"], ZOOM_RATIO_MIN), ZOOM_RATIO_MAX)
+    if abs(ratio - 1.0) <= ZOOM_RESCALE_MIN_CHANGE:
+        return entry["des"]
+    if abs(ratio - entry["cache_ratio"]) > 0.1 * ratio:
+        h, w = entry["gray"].shape
+        resized = cv2.resize(entry["gray"], (max(MIN_ORB_CROP_SIZE, int(round(w * ratio))),
+                                             max(MIN_ORB_CROP_SIZE, int(round(h * ratio)))))
+        _, des = orb_detector.detectAndCompute(resized, None)
+        entry["cache_ratio"] = ratio
+        entry["cache_des"] = des
+    return entry["cache_des"]
+
+
+def admit_template(bank, gray, zoom, score, orb_detector,
+                    max_size=TEMPLATE_BANK_MAX, min_gap=TEMPLATE_BANK_MIN_ZOOM_GAP,
+                    min_score=TEMPLATE_BANK_MIN_SCORE):
+    """Keep a small, zoom-spaced memory of confirmed appearances."""
+    if gray is None or score < min_score:
+        return False
+    if any(max(zoom, e["zoom"]) / min(zoom, e["zoom"]) < min_gap for e in bank):
+        return False
+    entry = make_template(gray, zoom, orb_detector)
+    if entry is None or entry["des"] is None:
+        return False
+    bank.append(entry)
+    if len(bank) > max_size:
+        bank.pop(0)
+    return True
 
 
 def refine_init_center(frame, point, orb_detector, box_size,
@@ -395,7 +454,7 @@ def orb_locate_candidates(orb, bf, search_gray, template_entries, box_size, offs
 
     best_pts = None
     best_total = 0
-    for kp1, des1 in template_entries:
+    for des1 in template_entries:
         if des1 is None or len(des1) < 2:
             continue
         matches = bf.knnMatch(des1, des2, k=2)
@@ -934,8 +993,13 @@ def main():
     n_votes = 0
 
     tracker = None
-    orig_orb = (None, None)
-    recent_orb = (None, None)
+    orig_template = None
+    recent_template = None
+    template_bank = []
+    n_ambiguity_skips = 0
+    cum_zoom = 1.0
+    zoom_at_size_update = 1.0
+    expected_object_size = float(BOX_SIZE)
     supporters = []
 
     dist_to_crosshair = math.hypot(point[0] - CX, point[1] - CY)
@@ -946,9 +1010,10 @@ def main():
         print(f"Tracker initialized on cleaned frame, box={init_box}")
 
         orig_tmpl_gray = crop_orb_template(cleaned1, init_box)
-        orig_orb = orb.detectAndCompute(orig_tmpl_gray, None) if orig_tmpl_gray is not None else (None, None)
-        recent_orb = orig_orb
-        print(f"Original ORB template: {len(orig_orb[0]) if orig_orb[0] else 0} keypoints")
+        orig_template = make_template(orig_tmpl_gray, cum_zoom, orb)
+        recent_template = make_template(orig_tmpl_gray, cum_zoom, orb)
+        template_bank = []
+        print(f"Original ORB template: {orig_template['n_kp'] if orig_template else 0} keypoints")
 
         supporters = init_supporters(
             cv2.cvtColor(cleaned1, cv2.COLOR_BGR2GRAY), init_box, cleaner.full_mask,
@@ -1032,6 +1097,7 @@ def main():
         cleaned = cleaner.clean(frame, hint_center=clean_hint)
         frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
+        supporter_motion_M = None
         if supporters:
             supporter_motion_M, _ = estimate_motion(prev_frame_gray, frame_gray, flow_mask_small)
             update_supporters(supporters, prev_frame_gray, frame_gray, supporter_motion_M,
@@ -1055,6 +1121,13 @@ def main():
                 vx, vy = estimate_velocity(pos_history)
                 predicted_pos = (predicted_pos[0] + vx, predicted_pos[1] + vy)
             lost_prev_gray = frame_gray
+
+        zoom_M = supporter_motion_M if supporter_motion_M is not None else lost_motion_M
+        if zoom_M is not None:
+            cum_zoom *= min(max(affine_scale(zoom_M), ZOOM_STEP_MIN), ZOOM_STEP_MAX)
+        size_ratio = min(max(cum_zoom / zoom_at_size_update, EXPECTED_SIZE_RATIO_MIN),
+                         EXPECTED_SIZE_RATIO_MAX)
+        expected_object_size = confirmed_object_size * size_ratio
 
         if state == "HOLDING":
             estimated = estimate_held_point(gray1_hold, frame_gray, hold_corners0, point)
@@ -1081,8 +1154,9 @@ def main():
                 tracker = cv2.TrackerVit_create(params)
                 tracker.init(cleaned, init_box)
                 orig_tmpl_gray = crop_orb_template(cleaned, init_box)
-                orig_orb = orb.detectAndCompute(orig_tmpl_gray, None) if orig_tmpl_gray is not None else (None, None)
-                recent_orb = orig_orb
+                orig_template = make_template(orig_tmpl_gray, cum_zoom, orb)
+                recent_template = make_template(orig_tmpl_gray, cum_zoom, orb)
+                template_bank = []
 
                 ok2, next_frame = cap.read()
                 peeked_gray = cv2.cvtColor(next_frame, cv2.COLOR_BGR2GRAY) if ok2 else None
@@ -1103,12 +1177,13 @@ def main():
                 score = 1.0
                 reason = "cleared crosshair" if dist_to_crosshair > args.near_crosshair_radius else "max hold reached"
                 print(f"Frame {frame_idx} | HOLDING->TRACKING ({reason}) | "
-                      f"init_box={init_box} after {hold_frames} held frames, ORB kp={len(orig_orb[0]) if orig_orb[0] else 0}")
+                      f"init_box={init_box} after {hold_frames} held frames, "
+                      f"ORB kp={orig_template['n_kp'] if orig_template else 0}")
 
         elif state == "TRACKING":
             if SCALE_RELATIVE_GATES:
                 dyn_max_area = max(MAX_BBOX_AREA_FRAC * frame_area,
-                                   GATE_AREA_GROWTH_FACTOR * confirmed_object_size ** 2)
+                                   GATE_AREA_GROWTH_FACTOR * expected_object_size ** 2)
                 dyn_max_aspect = max(MAX_BBOX_ASPECT_RATIO, confirmed_aspect * GATE_ASPECT_RELAX)
             else:
                 dyn_max_area = dyn_max_aspect = None
@@ -1145,7 +1220,10 @@ def main():
                         pos_history = [(cx, cy)]
                         refreshed_gray = crop_orb_template(cleaned, bbox)
                         if refreshed_gray is not None:
-                            recent_orb = orb.detectAndCompute(refreshed_gray, None)
+                            recent_template = make_template(refreshed_gray, cum_zoom, orb)
+                            if admit_template(template_bank, refreshed_gray, cum_zoom, score, orb):
+                                print(f"Frame {frame_idx} | Template bank snapshot at zoom={cum_zoom:.2f} "
+                                      f"({len(template_bank)} in bank)")
                         frames_since_refresh = 0
                         print(f"Frame {frame_idx} | TENTATIVE->TRACKING (confirmed) | bbox={bbox} | score={score:.3f}")
                 else:
@@ -1175,7 +1253,10 @@ def main():
                     if frames_since_refresh >= TEMPLATE_REFRESH_FRAMES:
                         refreshed_gray = crop_orb_template(cleaned, bbox)
                         if refreshed_gray is not None:
-                            recent_orb = orb.detectAndCompute(refreshed_gray, None)
+                            recent_template = make_template(refreshed_gray, cum_zoom, orb)
+                            if admit_template(template_bank, refreshed_gray, cum_zoom, score, orb):
+                                print(f"Frame {frame_idx} | Template bank snapshot at zoom={cum_zoom:.2f} "
+                                      f"({len(template_bank)} in bank)")
                         frames_since_refresh = 0
 
                     frames_since_supporter_refresh += 1
@@ -1246,11 +1327,17 @@ def main():
                     gray = cv2.cvtColor(cleaned, cv2.COLOR_BGR2GRAY)
                     search_region = gray[ry0:ry1, rx0:rx1]
 
+                    exp_sz = int(round(min(max(args.box_size, expected_object_size),
+                                           min(width, height) * 0.5)))
                     candidates = []
                     if search_region.shape[0] >= MIN_ORB_CROP_SIZE and search_region.shape[1] >= MIN_ORB_CROP_SIZE:
+                        template_entries = ([template_descriptors(orig_template, cum_zoom, orb),
+                                             template_descriptors(recent_template, cum_zoom, orb)]
+                                            + [template_descriptors(e, cum_zoom, orb)
+                                               for e in template_bank])
                         candidates = orb_locate_candidates(
-                            orb, bf, search_region, [orig_orb, recent_orb],
-                            box_size=(args.box_size, args.box_size), offset=(rx0, ry0))
+                            orb, bf, search_region, template_entries,
+                            box_size=(exp_sz, exp_sz), offset=(rx0, ry0))
 
                     candidate_bbox, n_matches, candidate_spread = None, 0, None
                     if len(candidates) == 1:
@@ -1273,6 +1360,11 @@ def main():
                                   f"consensus n_votes={n_votes}) | picked "
                                   f"bbox={tuple(round(v, 1) for v in candidate_bbox)} matches={n_matches} "
                                   f"consensus_dist={chosen_dist:.1f} | others={others}")
+                        elif candidates[1][1] >= PEAK_AMBIGUITY_RATIO * candidates[0][1]:
+                            n_ambiguity_skips += 1
+                            print(f"Frame {frame_idx} | LOST (ambiguity gate) | {len(candidates)} near-equal "
+                                  f"candidates (best={candidates[0][1]} vs second={candidates[1][1]} matches) "
+                                  f"and no supporter context -- not re-acquiring this frame")
                         else:
                             candidate_bbox, n_matches, candidate_spread = candidates[0]
                             print(f"Frame {frame_idx} | LOST (ambiguous: {len(candidates)} candidates, "
@@ -1322,8 +1414,10 @@ def main():
                 frames_since_motion_fallback = 0
                 pcx, pcy = predicted_pos
                 if VX0 <= pcx <= VX1 and 0 <= pcy <= height:
-                    half_b = args.box_size // 2
-                    fb_bbox = (int(round(pcx - half_b)), int(round(pcy - half_b)), args.box_size, args.box_size)
+                    fb_sz = int(round(min(max(args.box_size, expected_object_size),
+                                          min(width, height) * 0.5)))
+                    half_b = fb_sz // 2
+                    fb_bbox = (int(round(pcx - half_b)), int(round(pcy - half_b)), fb_sz, fb_sz)
                     if (static_guard_applies(fb_bbox, lost_motion_M)
                             and is_static_region(cleaned, prev_cleaned, fb_bbox)):
                         print(f"Frame {frame_idx} | LOST (motion-fallback static-region reject) | bbox={fb_bbox}")
@@ -1374,6 +1468,7 @@ def main():
         if state == "TRACKING" and not probation and bbox_valid_shape:
             current_size = math.sqrt(bbox[2] * bbox[3])
             confirmed_object_size += SIZE_SCALE_EMA_ALPHA * (current_size - confirmed_object_size)
+            zoom_at_size_update = cum_zoom
             current_aspect = max(bbox[2], bbox[3]) / min(bbox[2], bbox[3])
             confirmed_aspect += SIZE_SCALE_EMA_ALPHA * (current_aspect - confirmed_aspect)
         size_scale = size_toughness_scale(confirmed_object_size)
@@ -1436,7 +1531,7 @@ def main():
             if agree_dist <= TEMPLATE_REFRESH_AGREEMENT_MAX_DIST:
                 refreshed_gray = crop_orb_template(cleaned, bbox)
                 if refreshed_gray is not None:
-                    recent_orb = orb.detectAndCompute(refreshed_gray, None)
+                    recent_template = make_template(refreshed_gray, cum_zoom, orb)
                 frames_since_refresh = 0
                 n_consensus_gated_refreshes += 1
                 print(f"Frame {frame_idx} | CONSENSUS-GATED TEMPLATE REFRESH | vit_rel={vit_rel:.2f} "
@@ -1462,7 +1557,8 @@ def main():
           f"({n_shadow_fusion_multi_signal} from 2+ independent signals), "
           f"{n_winner_take_all_frames} frames the guard picked a single signal over disagreeing others "
           f"({n_winner_switches} actual sticky-winner switches), "
-          f"{n_consensus_gated_refreshes} consensus-gated template refreshes")
+          f"{n_consensus_gated_refreshes} consensus-gated template refreshes, "
+          f"{n_ambiguity_skips} ambiguity-gate skips, {len(template_bank)} bank templates")
     cap.release()
     if writer is not None:
         writer.release()
