@@ -122,6 +122,8 @@ MIN_SIGNAL_RELIABILITY = 0.05
 
 WINNER_SWITCH_MARGIN = 0.15
 WINNER_SWITCH_PERSISTENCE_FRAMES = 3
+STICKY_DECLINE_STREAK_THRESHOLD = 2  # consecutive frames of the sticky winner's OWN reliability
+                                      # dropping before its stickiness is waived entirely
 
 SIZE_SCALE_REFERENCE = BOX_SIZE
 SIZE_SCALE_MIN = 1.0
@@ -234,17 +236,25 @@ def size_toughness_scale(confirmed_size, reference=SIZE_SCALE_REFERENCE,
 
 
 def compute_guarded_final_position(signals, sticky_winner, challenger_name, challenger_streak,
+                                    sticky_prev_rel, sticky_decline_streak,
                                     max_agreement_dist=FUSION_AGREEMENT_MAX_DIST,
                                     switch_margin=WINNER_SWITCH_MARGIN,
-                                    switch_persistence=WINNER_SWITCH_PERSISTENCE_FRAMES):
+                                    switch_persistence=WINNER_SWITCH_PERSISTENCE_FRAMES,
+                                    decline_streak_threshold=STICKY_DECLINE_STREAK_THRESHOLD):
     """Returns (final_pos, mode, detail, new_sticky_winner, new_challenger_name,
-    new_challenger_streak); mode is "none"/"single"/"blended"/"winner-take-all"."""
+    new_challenger_streak, new_sticky_prev_rel, new_sticky_decline_streak);
+    mode is "none"/"single"/"blended"/"winner-take-all". `sticky_prev_rel`/
+    `sticky_decline_streak` track whether the CURRENT sticky winner's own
+    reliability has been dropping for consecutive frames -- once it has for
+    decline_streak_threshold frames, its stickiness is waived entirely (a
+    winner that's actively getting worse shouldn't be protected from a
+    switch just because no challenger has "clearly" overtaken it yet)."""
     usable = [(name, pos, rel) for name, pos, rel in signals if rel is not None and rel >= MIN_SIGNAL_RELIABILITY]
     if not usable:
-        return None, "none", "", None, None, 0
+        return None, "none", "", None, None, 0, None, 0
     if len(usable) == 1:
         name, pos, rel = usable[0]
-        return pos, "single", f"only {name} available (rel={rel:.2f})", name, None, 0
+        return pos, "single", f"only {name} available (rel={rel:.2f})", name, None, 0, rel, 0
 
     positions = [pos for _, pos, _ in usable]
     max_dist = max(math.hypot(a[0] - b[0], a[1] - b[1])
@@ -256,7 +266,7 @@ def compute_guarded_final_position(signals, sticky_winner, challenger_name, chal
         weights = ", ".join(f"{name}={rel / total_rel:.2f}" for name, _, rel in usable)
         return ((fx, fy), "blended",
                 f"agree within {max_dist:.1f}px (<= {max_agreement_dist}) | weights=[{weights}]",
-                None, None, 0)
+                None, None, 0, None, 0)
 
     by_name = {name: (pos, rel) for name, pos, rel in usable}
     naive_name, naive_pos, naive_rel = max(usable, key=lambda t: t[2])
@@ -265,21 +275,32 @@ def compute_guarded_final_position(signals, sticky_winner, challenger_name, chal
         return (naive_pos, "winner-take-all",
                 f"DISAGREEMENT {max_dist:.1f}px (> {max_agreement_dist}) -- adopting {naive_name} "
                 f"(rel={naive_rel:.2f}), no previous sticky winner active",
-                naive_name, None, 0)
+                naive_name, None, 0, naive_rel, 0)
 
     sticky_pos, sticky_rel = by_name[sticky_winner]
+    decline_streak = sticky_decline_streak + 1 if (sticky_prev_rel is not None
+                                                    and sticky_rel < sticky_prev_rel) else 0
+    declining = decline_streak >= decline_streak_threshold
+
     if naive_name == sticky_winner:
         return (sticky_pos, "winner-take-all",
                 f"DISAGREEMENT {max_dist:.1f}px (> {max_agreement_dist}) -- holding {sticky_winner} "
                 f"(rel={sticky_rel:.2f}), the naive best again",
-                sticky_winner, None, 0)
+                sticky_winner, None, 0, sticky_rel, decline_streak)
+
+    if declining:
+        return (naive_pos, "winner-take-all",
+                f"DISAGREEMENT {max_dist:.1f}px (> {max_agreement_dist}) -- {sticky_winner} declining "
+                f"{decline_streak} frames (rel={sticky_rel:.2f}) -- switching to {naive_name} "
+                f"(rel={naive_rel:.2f}) immediately, stickiness waived",
+                naive_name, None, 0, naive_rel, 0)
 
     if naive_rel < sticky_rel + switch_margin:
         return (sticky_pos, "winner-take-all",
                 f"DISAGREEMENT {max_dist:.1f}px (> {max_agreement_dist}) -- holding {sticky_winner} "
                 f"(rel={sticky_rel:.2f}); {naive_name} (rel={naive_rel:.2f}) ahead but not by the "
                 f"{switch_margin} margin required to switch",
-                sticky_winner, None, 0)
+                sticky_winner, None, 0, sticky_rel, decline_streak)
 
     new_streak = challenger_streak + 1 if challenger_name == naive_name else 1
     if new_streak >= switch_persistence:
@@ -287,12 +308,12 @@ def compute_guarded_final_position(signals, sticky_winner, challenger_name, chal
                 f"DISAGREEMENT {max_dist:.1f}px (> {max_agreement_dist}) -- SWITCHED to {naive_name} "
                 f"(rel={naive_rel:.2f}), ahead of {sticky_winner} (rel={sticky_rel:.2f}) by >= "
                 f"{switch_margin} for {new_streak} frames",
-                naive_name, naive_name, new_streak)
+                naive_name, naive_name, new_streak, naive_rel, 0)
     return (sticky_pos, "winner-take-all",
             f"DISAGREEMENT {max_dist:.1f}px (> {max_agreement_dist}) -- holding {sticky_winner} "
             f"(rel={sticky_rel:.2f}); {naive_name} ahead by >= {switch_margin} for "
             f"{new_streak}/{switch_persistence} frames, not yet enough to switch",
-            sticky_winner, naive_name, new_streak)
+            sticky_winner, naive_name, new_streak, sticky_rel, decline_streak)
 
 
 def cluster_orb_matches(pts, cluster_dist):
@@ -819,6 +840,8 @@ def main():
     sticky_winner = None
     challenger_name = None
     challenger_streak = 0
+    sticky_prev_rel = None
+    sticky_decline_streak = 0
     confirmed_object_size = float(BOX_SIZE)
     last_logged_size_scale = 1.0
     final_pos = None
@@ -1272,12 +1295,14 @@ def main():
         if state == "HOLDING":
             final_pos, final_mode, final_detail = held_point, "held", "pre-init"
             sticky_winner, challenger_name, challenger_streak = None, None, 0
+            sticky_prev_rel, sticky_decline_streak = None, 0
         else:
             prev_sticky_winner = sticky_winner
             (final_pos, final_mode, final_detail,
-             sticky_winner, challenger_name, challenger_streak) = compute_guarded_final_position(
+             sticky_winner, challenger_name, challenger_streak,
+             sticky_prev_rel, sticky_decline_streak) = compute_guarded_final_position(
                 signals_this_frame, sticky_winner, challenger_name, challenger_streak,
-                max_agreement_dist=FUSION_AGREEMENT_MAX_DIST * size_scale,
+                sticky_prev_rel, sticky_decline_streak,
                 switch_persistence=round(WINNER_SWITCH_PERSISTENCE_FRAMES * size_scale))
             if final_mode == "winner-take-all" and sticky_winner != prev_sticky_winner:
                 n_winner_switches += 1
