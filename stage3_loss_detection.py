@@ -27,15 +27,19 @@ TEMPLATE_MATCH_THRESHOLD = 0.10  # kept low; NCC signal is weak
 GOOD_TEMPLATE_SCORE = 0.5
 
 
-def is_valid(bbox, score, frame_area):
+def is_valid(bbox, score, frame_area, max_area=None, max_aspect=None):
     if score < SCORE_THRESHOLD:
         return False
     x, y, w, h = bbox
     if w <= 0 or h <= 0:
         return False
-    if (w * h) > MAX_BBOX_AREA_FRAC * frame_area:
+    if max_area is None:
+        max_area = MAX_BBOX_AREA_FRAC * frame_area
+    if max_aspect is None:
+        max_aspect = MAX_BBOX_ASPECT_RATIO
+    if (w * h) > max_area:
         return False
-    if max(w, h) > MAX_BBOX_ASPECT_RATIO * min(w, h):
+    if max(w, h) > max_aspect * min(w, h):
         return False
     return True
 

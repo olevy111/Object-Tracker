@@ -35,6 +35,9 @@ BOX_SIZE = 40
 WINDOW_NAME = "Stage 5.5.1 - Reliability-Weighted Fusion (Stage 2: guarded acting + unified output)"
 DEFAULT_MODEL = "models/object_tracking_vittrack_2023sep.onnx"
 
+INIT_REFINE_SEARCH_RADIUS = 8   # px; how far to search around the click for a better anchor center
+INIT_REFINE_STEP = 2            # px; grid step size for that search
+
 ORB_NFEATURES = 500
 ORB_EDGE_THRESHOLD = 8    # 31 default leaves no valid area on a small template
 ORB_PATCH_SIZE = 16
@@ -52,8 +55,14 @@ LINE_GRACE_COOLDOWN = 10
 
 CONFIRM_FRAMES = 20
 RECOVERY_SCORE_THRESHOLD = 0.42  # distinctly above SCORE_THRESHOLD (0.30)
+PROBATION_COUNT_DECAY = 2  # a sub-recovery-score frame costs this much progress instead of all of it
+TENTATIVE_TRUST_MIN_FRAMES = 75  # a tentative that tracked this long anchors the resumed search
+                                  # at its own last position instead of the stale confirmed one
 
 STATIC_DIFF_THRESHOLD = 2.0
+STATIC_GUARD_MIN_EXPECTED_MOTION = 1.5  # px/frame; below this the scene is expected to look
+                                         # static here (e.g. zoom focus of expansion), so the
+                                         # static-region test cannot separate object from HUD
 
 NEAR_CROSSHAIR_RADIUS = 45
 HOLD_CORNER_NEIGHBORHOOD = 70
@@ -130,6 +139,10 @@ SIZE_SCALE_MIN = 1.0
 SIZE_SCALE_MAX = 4.0
 SIZE_SCALE_EMA_ALPHA = 0.1
 
+SCALE_RELATIVE_GATES = True  # validity caps grow with the confirmed object's own measured size
+GATE_AREA_GROWTH_FACTOR = 4.0
+GATE_ASPECT_RELAX = 1.5
+
 TEMPLATE_REFRESH_AGREEMENT_MAX_DIST = 10
 TEMPLATE_REFRESH_MIN_RELIABILITY = 0.6
 TEMPLATE_REFRESH_MIN_COOLDOWN = 20
@@ -158,6 +171,27 @@ def crop_orb_template(frame, bbox, padding=ORB_TEMPLATE_PADDING):
         return None
     crop = frame[y0:y1, x0:x1]
     return cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+
+def refine_init_center(frame, point, orb_detector, box_size,
+                        search_radius=INIT_REFINE_SEARCH_RADIUS, step=INIT_REFINE_STEP):
+    """Search a small grid around `point` for the box center whose padded
+    ORB template has the most keypoints, and return that center instead.
+    Falls back to `point` unchanged if nothing scores higher."""
+    px, py = point
+    best_point, best_count = point, -1
+    for dx in range(-search_radius, search_radius + 1, step):
+        for dy in range(-search_radius, search_radius + 1, step):
+            cx, cy = px + dx, py + dy
+            box = (cx - box_size // 2, cy - box_size // 2, box_size, box_size)
+            template = crop_orb_template(frame, box)
+            if template is None:
+                continue
+            n_kp = len(orb_detector.detect(template, None))
+            if n_kp > best_count:
+                best_count = n_kp
+                best_point = (cx, cy)
+    return best_point, best_count
 
 
 def estimate_motion_with_inliers(prev_gray, curr_gray, feature_mask_small, scale=GMC_DOWNSCALE):
@@ -387,6 +421,19 @@ def orb_locate_candidates(orb, bf, search_gray, template_entries, box_size, offs
     return candidates
 
 
+def expected_gmc_displacement(bbox, M):
+    if M is None:
+        return None
+    cx, cy = bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2
+    nx, ny = transform_point((cx, cy), M)
+    return math.hypot(nx - cx, ny - cy)
+
+
+def static_guard_applies(bbox, M, min_expected=STATIC_GUARD_MIN_EXPECTED_MOTION):
+    disp = expected_gmc_displacement(bbox, M)
+    return disp is None or disp >= min_expected
+
+
 def is_static_region(curr_frame, prev_frame, bbox, threshold=STATIC_DIFF_THRESHOLD):
     x, y, w, h = [int(round(v)) for v in bbox]
     x0, y0 = max(0, x), max(0, y)
@@ -398,15 +445,19 @@ def is_static_region(curr_frame, prev_frame, bbox, threshold=STATIC_DIFF_THRESHO
     return float(cv2.absdiff(curr_region, prev_region).mean()) < threshold
 
 
-def is_valid_for_recovery(bbox, score, frame_area):
+def is_valid_for_recovery(bbox, score, frame_area, max_area=None, max_aspect=None):
     if score < RECOVERY_SCORE_THRESHOLD:
         return False
     x, y, w, h = bbox
     if w <= 0 or h <= 0:
         return False
-    if (w * h) > MAX_BBOX_AREA_FRAC * frame_area:
+    if max_area is None:
+        max_area = MAX_BBOX_AREA_FRAC * frame_area
+    if max_aspect is None:
+        max_aspect = MAX_BBOX_ASPECT_RATIO
+    if (w * h) > max_area:
         return False
-    return max(w, h) <= MAX_BBOX_ASPECT_RATIO * min(w, h)
+    return max(w, h) <= max_aspect * min(w, h)
 
 
 def estimate_velocity(pos_history):
@@ -788,6 +839,11 @@ def main():
     orb = make_orb()
     bf = cv2.BFMatcher(cv2.NORM_HAMMING)
 
+    refined_point, refined_kp = refine_init_center(cleaned1, point, orb, args.box_size)
+    if refined_point != point:
+        print(f"Refined init point: {point} -> {refined_point} ({refined_kp} keypoints)")
+    point = refined_point
+
     cv2.namedWindow(WINDOW_NAME)
     show_cleaned = args.show_cleaned
     show_mask = args.show_mask
@@ -812,6 +868,8 @@ def main():
     prev_frame_raw = frame1
 
     bad_count = 0
+    probation_frames = 0
+    tentative_last_pos = None
     frames_since_refresh = 0
     frames_since_supporter_refresh = 0
     line_grace_remaining = 0
@@ -843,6 +901,7 @@ def main():
     sticky_prev_rel = None
     sticky_decline_streak = 0
     confirmed_object_size = float(BOX_SIZE)
+    confirmed_aspect = 1.0
     last_logged_size_scale = 1.0
     final_pos = None
     consensus_pos = None
@@ -887,6 +946,7 @@ def main():
         held_point = (float(point[0]), float(point[1]))
         hold_frames = 0
         gray1_hold = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
+        hold_prev_gray = gray1_hold
         hold_corners0 = find_hold_corners(gray1_hold, point, cleaner.full_mask)
         print(f"Holding with {len(hold_corners0) if hold_corners0 is not None else 0} local reference corners")
         pos_history = [held_point]
@@ -957,11 +1017,13 @@ def main():
         prev_frame_raw = frame
 
         gmc_rel = None
+        lost_motion_M = None
         uncertain = (state == "LOST") or (state == "TRACKING" and probation)
         if uncertain and lost_prev_gray is not None and predicted_pos is not None:
             curr_gray_gmc = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             motion_M, gmc_n_matches, gmc_inlier_ratio = estimate_motion_with_inliers(
                 lost_prev_gray, curr_gray_gmc, flow_mask_small)
+            lost_motion_M = motion_M
             gmc_rel = gmc_reliability(gmc_inlier_ratio, lost_frames)
             print(f"Frame {frame_idx} | Reliability | gmc={gmc_rel:.2f} "
                   f"(inlier_ratio={gmc_inlier_ratio:.2f}, matches={gmc_n_matches}, "
@@ -978,12 +1040,21 @@ def main():
             estimated = estimate_held_point(gray1_hold, curr_gray_hold, hold_corners0, point)
             if estimated is not None:
                 held_point = estimated
+            else:
+                hold_M, _ = estimate_motion(hold_prev_gray, curr_gray_hold, flow_mask_small)
+                if hold_M is not None:
+                    held_point = transform_point(held_point, hold_M)
+                    print(f"Frame {frame_idx} | HOLDING local flow unavailable -- held point "
+                          f"carried by GMC to ({held_point[0]:.1f},{held_point[1]:.1f})")
+            hold_prev_gray = curr_gray_hold
             hold_frames += 1
 
             dist_to_crosshair = math.hypot(held_point[0] - CX, held_point[1] - CY)
             if dist_to_crosshair > args.near_crosshair_radius or hold_frames >= MAX_HOLD_FRAMES:
                 hx = min(max(held_point[0], VX0 + half), VX1 - half)
                 hy = min(max(held_point[1], half), height - half)
+                (hx, hy), refined_kp = refine_init_center(cleaned, (int(round(hx)), int(round(hy))),
+                                                           orb, args.box_size)
                 init_box = (int(round(hx - half)), int(round(hy - half)), args.box_size, args.box_size)
 
                 tracker = cv2.TrackerVit_create(params)
@@ -1014,12 +1085,20 @@ def main():
                       f"init_box={init_box} after {hold_frames} held frames, ORB kp={len(orig_orb[0]) if orig_orb[0] else 0}")
 
         elif state == "TRACKING":
+            if SCALE_RELATIVE_GATES:
+                dyn_max_area = max(MAX_BBOX_AREA_FRAC * frame_area,
+                                   GATE_AREA_GROWTH_FACTOR * confirmed_object_size ** 2)
+                dyn_max_aspect = max(MAX_BBOX_ASPECT_RATIO, confirmed_aspect * GATE_ASPECT_RELAX)
+            else:
+                dyn_max_area = dyn_max_aspect = None
             _, bbox = tracker.update(cleaned)
             score = tracker.getTrackingScore()
-            valid = is_valid(bbox, score, frame_area)
+            valid = is_valid(bbox, score, frame_area, dyn_max_area, dyn_max_aspect)
+            eff_max_area = dyn_max_area if dyn_max_area is not None else MAX_BBOX_AREA_FRAC * frame_area
+            eff_max_aspect = dyn_max_aspect if dyn_max_aspect is not None else MAX_BBOX_ASPECT_RATIO
             geo_sane = (bbox[2] > 0 and bbox[3] > 0
-                        and (bbox[2] * bbox[3]) <= MAX_BBOX_AREA_FRAC * frame_area
-                        and max(bbox[2], bbox[3]) <= MAX_BBOX_ASPECT_RATIO * min(bbox[2], bbox[3]))
+                        and (bbox[2] * bbox[3]) <= eff_max_area
+                        and max(bbox[2], bbox[3]) <= eff_max_aspect * min(bbox[2], bbox[3]))
             currently_overlapping = geo_sane and bbox_overlaps_mask(bbox, cleaner.full_mask, OCCLUSION_MARGIN)
             if currently_overlapping:
                 line_grace_remaining = LINE_GRACE_COOLDOWN
@@ -1030,12 +1109,14 @@ def main():
             if probation:
                 lost_frames += 1
                 frames_since_motion_fallback += 1
+                probation_frames += 1
                 if valid:
+                    tentative_last_pos = (bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2)
                     bad_count = 0
-                    if is_valid_for_recovery(bbox, score, frame_area):
+                    if is_valid_for_recovery(bbox, score, frame_area, dyn_max_area, dyn_max_aspect):
                         probation_count += 1
                     else:
-                        probation_count = 0
+                        probation_count = max(0, probation_count - PROBATION_COUNT_DECAY)
                     if probation_count >= CONFIRM_FRAMES:
                         probation = False
                         last_good_bbox = bbox
@@ -1053,8 +1134,14 @@ def main():
                         state = "LOST"
                         probation = False
                         n_transitions += 1
-                        print(f"Frame {frame_idx} | TENTATIVE->LOST (candidate did not hold) | "
-                              f"score={score:.3f} | resuming search from last CONFIRMED position")
+                        if probation_frames >= TENTATIVE_TRUST_MIN_FRAMES and tentative_last_pos is not None:
+                            predicted_pos = tentative_last_pos
+                            print(f"Frame {frame_idx} | TENTATIVE->LOST (candidate did not hold) | "
+                                  f"score={score:.3f} | resuming search from the {probation_frames}-frame "
+                                  f"tentative's last position ({predicted_pos[0]:.1f},{predicted_pos[1]:.1f})")
+                        else:
+                            print(f"Frame {frame_idx} | TENTATIVE->LOST (candidate did not hold) | "
+                                  f"score={score:.3f} | resuming search from last CONFIRMED position")
             elif valid or near_line:
                 bad_count = 0
                 last_good_bbox = bbox
@@ -1188,7 +1275,8 @@ def main():
                             print(f"Frame {frame_idx} | LOST (distance-gate reject) | matches={n_matches} | "
                                   f"predicted=({pcx:.1f},{pcy:.1f}) | candidate=({ccx:.1f},{ccy:.1f}) | "
                                   f"dist={dist_from_pred:.1f} > {MAX_ACCEPT_DISTANCE}")
-                        elif is_static_region(cleaned, prev_cleaned, candidate_bbox):
+                        elif (static_guard_applies(candidate_bbox, lost_motion_M)
+                              and is_static_region(cleaned, prev_cleaned, candidate_bbox)):
                             n_static_rejections += 1
                             print(f"Frame {frame_idx} | LOST (static-region reject) | matches={n_matches} | "
                                   f"bbox={tuple(round(v, 1) for v in candidate_bbox)}")
@@ -1198,6 +1286,8 @@ def main():
                             state = "TRACKING"
                             probation = True
                             probation_count = 0
+                            probation_frames = 0
+                            tentative_last_pos = None
                             bad_count = 0
                             line_grace_remaining = 0
                             bbox = candidate_bbox
@@ -1214,7 +1304,8 @@ def main():
                 if VX0 <= pcx <= VX1 and 0 <= pcy <= height:
                     half_b = args.box_size // 2
                     fb_bbox = (int(round(pcx - half_b)), int(round(pcy - half_b)), args.box_size, args.box_size)
-                    if is_static_region(cleaned, prev_cleaned, fb_bbox):
+                    if (static_guard_applies(fb_bbox, lost_motion_M)
+                            and is_static_region(cleaned, prev_cleaned, fb_bbox)):
                         print(f"Frame {frame_idx} | LOST (motion-fallback static-region reject) | bbox={fb_bbox}")
                     else:
                         tracker = cv2.TrackerVit_create(params)
@@ -1222,6 +1313,8 @@ def main():
                         state = "TRACKING"
                         probation = True
                         probation_count = 0
+                        probation_frames = 0
+                        tentative_last_pos = None
                         bad_count = 0
                         line_grace_remaining = 0
                         bbox = fb_bbox
@@ -1261,6 +1354,8 @@ def main():
         if state == "TRACKING" and not probation and bbox_valid_shape:
             current_size = math.sqrt(bbox[2] * bbox[3])
             confirmed_object_size += SIZE_SCALE_EMA_ALPHA * (current_size - confirmed_object_size)
+            current_aspect = max(bbox[2], bbox[3]) / min(bbox[2], bbox[3])
+            confirmed_aspect += SIZE_SCALE_EMA_ALPHA * (current_aspect - confirmed_aspect)
         size_scale = size_toughness_scale(confirmed_object_size)
         if round(size_scale, 2) != round(last_logged_size_scale, 2):
             print(f"Frame {frame_idx} | Size-scaled toughness | confirmed_size={confirmed_object_size:.1f}px "
