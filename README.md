@@ -1,4 +1,4 @@
-# Pixel Tracker
+# Object Tracker
 
 Real-time single-object tracking in aerial video. You pick one pixel on the first
 frame, and the tracker follows that object through the video -- including losing it
