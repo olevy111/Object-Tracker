@@ -140,11 +140,20 @@ SCREEN_FIT_MARGIN = 0.90
 
 
 def get_screen_size():
-    try:
+    try:  # Windows
         import ctypes
         user32 = ctypes.windll.user32
         user32.SetProcessDPIAware()
         return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+    except Exception:
+        pass
+    try:  # macOS / Linux
+        import tkinter
+        root = tkinter.Tk()
+        root.withdraw()
+        size = (root.winfo_screenwidth(), root.winfo_screenheight())
+        root.destroy()
+        return size
     except Exception:
         return 1280, 720
 

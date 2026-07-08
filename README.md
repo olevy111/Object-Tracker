@@ -16,9 +16,21 @@ CPU (no GPU needed) at 30+ fps on 1920x1080 video.
 - **Windows:** double-click **`run_tracker.bat`**
 - **macOS:** double-click **`run_tracker.command`**
 
-That's it. On the first run it sets everything up by itself (including downloading
-and installing Python if the computer doesn't have it -- one time, a few minutes,
-no admin rights needed). After that it starts instantly.
+That's it. On the first run it sets everything up by itself (creates a virtual
+environment, installs the packages, and on Windows downloads Python if the computer
+doesn't have it). It then verifies the installation before opening the app, so a
+failed setup stops with a clear message instead of a broken run. After the first
+run it starts instantly.
+
+To check a computer at any time without starting the app:
+
+```
+venv/Scripts/python src/check_setup.py      (Windows)
+venv/bin/python src/check_setup.py          (macOS / Linux)
+```
+
+It reports Python, package versions, the tracking model, and the video/display
+backends, and exits with an error if anything required is missing.
 
 ## Using the app
 
@@ -45,9 +57,9 @@ Keys:
 
 | | Version used |
 |---|---|
-| Python | 3.12 (installed automatically if missing) |
-| opencv-python | 5.0.0.93 |
-| numpy | 2.5.0 |
+| Python | 3.9 or newer (developed on 3.12) |
+| opencv-python | 5.0.0.93 (any 4.9+ works) |
+| numpy | 2.5.0 (any 1.26+ works) |
 
 The VitTrack tracking model (`models/object_tracking_vittrack_2023sep.onnx`) is
 included in the repository. `tkinter` (part of the standard Python installation) is
@@ -98,5 +110,6 @@ document linked above.
 | `src/overlay.py` | overlay removal (masking + inpainting) and screen-fit helpers |
 | `src/loss_detection.py` | validity checks for the tracker's output |
 | `src/gmc.py` | global camera-motion estimation |
+| `src/check_setup.py` | verifies this computer can run the tracker |
 | `models/` | the VitTrack ONNX model |
 | `requirements.txt` | Python package versions |

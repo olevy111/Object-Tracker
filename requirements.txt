@@ -1,2 +1,5 @@
-opencv-python==5.0.0.93
-numpy==2.5.0
+# Developed and tested with opencv-python 5.0.0.93 and numpy 2.5.0 on Python 3.12.
+# Version ranges (not exact pins) so the app also installs on Python 3.9-3.11,
+# where the newest numpy is not published.
+opencv-python>=4.9,<6
+numpy>=1.26,<3

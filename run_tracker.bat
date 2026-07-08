@@ -59,6 +59,15 @@ if errorlevel 1 (
         pause
         exit /b 1
     )
+    echo.
+    echo Verifying the installation...
+    venv\Scripts\python.exe src\check_setup.py
+    if errorlevel 1 (
+        echo ERROR: setup check failed ^(see the report above^).
+        pause
+        exit /b 1
+    )
+    echo.
 )
 
 start "" venv\Scripts\pythonw.exe src\app.py
